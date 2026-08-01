@@ -19,7 +19,7 @@ MODULES = {
     "Spectrum": "spectrum.py",
     "Spectrogram": "spectrogram.py",
     "Stereometer": "stereometer.py",
-    "Oscilloscope": "oscilloscope.py",
+    "Spectrum Analyzer": "spectrum_analyzer.py",
 }
 
 
