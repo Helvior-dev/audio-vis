@@ -23,7 +23,7 @@ import numpy as np
 from OpenGL.GL import *
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from modules.audio_capture import AudioCapture
+from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
 
 # how many samples wide the visible waveform window is;
