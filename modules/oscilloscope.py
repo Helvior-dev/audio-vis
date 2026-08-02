@@ -91,7 +91,7 @@ class WaveformWindow:
 
         self.width, self.height = 800, 300
         self.window = glfw.create_window(
-            self.width, self.height, "Waveform", None, None
+            self.width, self.height, "Oscilloscope", None, None
         )
         if not self.window:
             glfw.terminate()

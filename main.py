@@ -20,7 +20,7 @@ MODULES_DIR = Path(__file__).parent / "modules"
 # display name -> (script filename, icon key)
 MODULES = [
     ("Loudness",          "loudness.py",          "bars"),
-    ("Waveform",           "waveform.py",          "wave"),
+    ("Oscilloscope",           "oscilloscope.py",          "wave"),
     ("Spectrum",            "spectrum.py",          "spectrum"),
     ("Stereometer",       "stereometer.py",       "dots"),
     ("Spectrum Analyzer", "spectrum_analyzer.py", "spectrum_dense"),

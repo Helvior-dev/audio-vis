@@ -1,15 +1,14 @@
 """
-Stereometer module: Lissajous-style stereo field display + correlation meter.
+Vectorscope module (renamed from Stereometer -- "vectorscope" is the
+standard term for this display in audio engineering, matches the
+reference app's naming).
 
-Standard technique: plot Mid (L+R) on Y and Side (L-R) on X. A mono
-signal (L==R) collapses to a vertical line since Side=0. Fully
-out-of-phase content spreads horizontally. This is the same
-transform MiniMeters' "Linear" display mode uses.
-
-Correlation meter (bottom bar) shows the same information as a single
-number: +1 = perfectly in-phase/mono, 0 = uncorrelated/wide, -1 = out
-of phase (potential mono-compatibility problem -- bass in particular
-being out of phase is a real mixing issue, not just a visual curiosity).
+Core visualization (the Lissajous scatter plot) is unchanged from the
+original stereometer.py -- same Mid/Side transform, same point cloud.
+This pass only builds out the surrounding chrome to match the
+reference layout: title bar text, diagonal L/M/R/S guide lines with
+axis labels, and a labeled correlation readout ("corr 0.XX") instead
+of a bare color bar.
 """
 
 import sys
@@ -23,6 +22,7 @@ from OpenGL.GL import *
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
+from text_render import TextRenderer, TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, link_program as text_link_program
 
 HISTORY_POINTS = 1024  # how many recent samples are plotted as dots
 
@@ -39,9 +39,10 @@ void main() {
 FRAGMENT_SHADER = """
 #version 330
 uniform vec3 color;
+uniform float alpha;
 out vec4 out_color;
 void main() {
-    out_color = vec4(color, 1.0);
+    out_color = vec4(color, alpha);
 }
 """
 
@@ -71,7 +72,7 @@ def link_program(vertex_src: str, fragment_src: str) -> int:
     return program
 
 
-class StereometerWindow:
+class VectorscopeWindow:
     def __init__(self):
         if not glfw.init():
             raise RuntimeError("GLFW init failed")
@@ -83,7 +84,7 @@ class StereometerWindow:
         glfw.window_hint(glfw.FLOATING, glfw.TRUE)
         glfw.window_hint(glfw.RESIZABLE, glfw.TRUE)
 
-        self.width, self.height = 500, 550
+        self.width, self.height = 500, 500
         self.window = glfw.create_window(self.width, self.height, "Stereometer", None, None)
         if not self.window:
             glfw.terminate()
@@ -92,14 +93,25 @@ class StereometerWindow:
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
         glfw.set_framebuffer_size_callback(self.window, self._on_resize)
+        # lock resize to a 1:1 aspect ratio -- without this, dragging a
+        # corner unevenly would stretch the diamond grid into an ellipse
+        glfw.set_window_aspect_ratio(self.window, 1, 1)
         apply_dark_titlebar(self.window)
 
         self.program = link_program(VERTEX_SHADER, FRAGMENT_SHADER)
         self.color_loc = glGetUniformLocation(self.program, "color")
+        self.alpha_loc = glGetUniformLocation(self.program, "alpha")
         self.offset_loc = glGetUniformLocation(self.program, "offset")
         self.scale_loc = glGetUniformLocation(self.program, "scale")
 
-        # scatter points for the Lissajous field
+        # text rendering (title, axis labels, corr readout) -- separate
+        # program since it samples a glyph-atlas texture instead of
+        # taking a flat color uniform
+        self.text_program = text_link_program(TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER)
+        self.text = TextRenderer(self.text_program)
+
+        # scatter points for the Lissajous field -- unchanged from the
+        # original stereometer.py, this is the part we do not touch
         self.points_vao = glGenVertexArrays(1)
         glBindVertexArray(self.points_vao)
         self.points_vbo = glGenBuffers(1)
@@ -111,16 +123,20 @@ class StereometerWindow:
         glBindVertexArray(0)
         glPointSize(2.0)
 
-        # a single dynamic quad, reused for the correlation bar
-        self.bar_vao = glGenVertexArrays(1)
-        glBindVertexArray(self.bar_vao)
-        self.bar_vbo = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, self.bar_vbo)
+        # generic dynamic-quad/line VBO reused for: correlation bar,
+        # diagonal guide lines, background track
+        self.line_vao = glGenVertexArrays(1)
+        glBindVertexArray(self.line_vao)
+        self.line_vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
         glBufferData(GL_ARRAY_BUFFER, 6 * 2 * 4, None, GL_DYNAMIC_DRAW)
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         self.audio = AudioCapture(chunk_size=256)
         self.points = np.zeros((HISTORY_POINTS, 2), dtype=np.float32)
@@ -147,62 +163,116 @@ class StereometerWindow:
             self.points = np.roll(self.points, -n, axis=0)
             self.points[-n:] = new_points
 
-        # Pearson correlation between L and R over this chunk.
-        # +1 = identical (mono), -1 = perfectly inverted, 0 = uncorrelated.
         if np.std(left) > 1e-6 and np.std(right) > 1e-6:
             corr = np.corrcoef(left, right)[0, 1]
             self.correlation = float(np.clip(corr, -1.0, 1.0))
-        # if either channel is silent, correlation is undefined -- hold last value
 
     def _quad_verts(self, x0, x1, y0, y1) -> np.ndarray:
         return np.array(
             [x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1], dtype=np.float32
         )
 
+    def _draw_line(self, x0, y0, x1, y1, color, alpha=1.0, width=1.0):
+        glUniform2f(self.offset_loc, 0.0, 0.0)
+        glUniform1f(self.scale_loc, 1.0)
+        glUniform3f(self.color_loc, *color)
+        glUniform1f(self.alpha_loc, alpha)
+        glLineWidth(width)
+        verts = np.array([x0, y0, x1, y1], dtype=np.float32)
+        glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+        glDrawArrays(GL_LINES, 0, 2)
+
+    def _draw_quad(self, x0, y0, x1, y1, color, alpha=1.0):
+        glUniform2f(self.offset_loc, 0.0, 0.0)
+        glUniform1f(self.scale_loc, 1.0)
+        glUniform3f(self.color_loc, *color)
+        glUniform1f(self.alpha_loc, alpha)
+        verts = self._quad_verts(x0, x1, y0, y1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+
     def render_frame(self):
-        glClearColor(0.0, 0.0, 0.0, 1.0)
+        glClearColor(0.03, 0.03, 0.04, 1.0)
         glClear(GL_COLOR_BUFFER_BIT)
         glUseProgram(self.program)
+        glBindVertexArray(self.line_vao)
 
-        # Lissajous field occupies the top ~80% of the window, correlation
-        # bar occupies the bottom ~15%, with a small gap between them.
-        glUniform2f(self.offset_loc, 0.0, 0.15)
-        glUniform1f(self.scale_loc, 0.8)
-        glUniform3f(self.color_loc, 0.6, 0.85, 0.95)
+        # ---- vectorscope field layout ----
+        # the scatter field is a square centered in the upper ~75% of the
+        # window; correlation bar sits in a separate strip at the bottom,
+        # matching the reference screenshot's proportions
+        field_cy = 0.18     # NDC y-center of the diamond field
+        field_scale = 0.62  # NDC half-size of the diamond
+
+        # diagonal guide lines forming the diamond (L-M-R-S axes), dim
+        diag_color = (0.28, 0.30, 0.34)
+        self._draw_line(-field_scale, field_cy, 0.0, field_cy + field_scale, diag_color, alpha=0.8)
+        self._draw_line(0.0, field_cy + field_scale, field_scale, field_cy, diag_color, alpha=0.8)
+        self._draw_line(field_scale, field_cy, 0.0, field_cy - field_scale, diag_color, alpha=0.8)
+        self._draw_line(0.0, field_cy - field_scale, -field_scale, field_cy, diag_color, alpha=0.8)
+
+        # ---- scatter points (untouched core visualization) ----
+        glUniform2f(self.offset_loc, 0.0, field_cy)
+        glUniform1f(self.scale_loc, field_scale * 0.9)
+        glUniform3f(self.color_loc, 0.6, 0.85, 0.95)  # original stereometer.py color, unchanged
+        glUniform1f(self.alpha_loc, 0.8)
 
         glBindVertexArray(self.points_vao)
         glBindBuffer(GL_ARRAY_BUFFER, self.points_vbo)
         glBufferSubData(GL_ARRAY_BUFFER, 0, self.points.nbytes, self.points)
         glDrawArrays(GL_POINTS, 0, HISTORY_POINTS)
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-        glBindVertexArray(0)
+        glBindVertexArray(self.line_vao)  # switch back for the rest of this frame
 
-        # correlation bar: centered at correlation=0, fills toward +1 (right) or -1 (left)
-        glUniform2f(self.offset_loc, 0.0, 0.0)
-        glUniform1f(self.scale_loc, 1.0)
+        # ---- axis labels: L / M / R / S at the four diamond tips ----
+        label_color = (0.55, 0.55, 0.6)
+        label_offset = field_scale + 0.09
+        self.text.draw("L", -label_offset, field_cy + 0.03, pixel_scale=1.6,
+                        win_w=self.width, win_h=self.height, color=label_color, align="center")
+        self.text.draw("M", -0.0, field_cy + field_scale + 0.10, pixel_scale=1.6,
+                        win_w=self.width, win_h=self.height, color=label_color, align="center")
+        self.text.draw("R", label_offset, field_cy + 0.03, pixel_scale=1.6,
+                        win_w=self.width, win_h=self.height, color=label_color, align="center")
+        self.text.draw("S", -0.0, field_cy - field_scale - 0.02, pixel_scale=1.6,
+                        win_w=self.width, win_h=self.height, color=label_color, align="center")
+        # second "S" tag near the right diagonal, matching the reference's
+        # two-S layout (S appears at both side-channel extremes)
+        self.text.draw("S", label_offset - 0.03, field_cy - 0.11, pixel_scale=1.2,
+                        win_w=self.width, win_h=self.height, color=label_color, align="center")
 
-        bar_y0, bar_y1 = -0.95, -0.8
+        glUseProgram(self.program)
+        glBindVertexArray(self.line_vao)
+
+        # ---- title, top-left ----
+        self.text.draw("STEREOMETER", -0.94, 0.92, pixel_scale=1.5,
+                        win_w=self.width, win_h=self.height, color=(0.85, 0.85, 0.9))
+
+        # text.draw() switches to text_program internally -- must restore
+        # self.program before issuing more glUniform*/glDrawArrays calls
+        # that target it, or GL rejects them (invalid operation: wrong
+        # program bound for that uniform location)
+        glUseProgram(self.program)
+        glBindVertexArray(self.line_vao)
+
+        # ---- correlation bar + numeric readout, bottom ----
+        bar_y0, bar_y1 = -0.86, -0.80
+        bar_x0, bar_x1 = -0.7, 0.7
+        self._draw_quad(bar_x0, bar_y0, bar_x1, bar_y1, (0.14, 0.14, 0.17))  # track
+
         x_zero = 0.0
-        x_val = self.correlation * 0.9  # 0.9 so it doesn't touch the window edge at +-1
-
-        glBindVertexArray(self.bar_vao)
-        glBindBuffer(GL_ARRAY_BUFFER, self.bar_vbo)
-
+        x_val = (self.correlation * 0.9) * ((bar_x1 - bar_x0) / 2)
+        fill_color = (0.35, 0.75, 0.95) if self.correlation >= -0.3 else (0.9, 0.25, 0.2)
         if self.correlation >= 0:
-            verts = self._quad_verts(x_zero, x_val, bar_y0, bar_y1)
+            self._draw_quad(x_zero, bar_y0, x_val, bar_y1, fill_color)
         else:
-            verts = self._quad_verts(x_val, x_zero, bar_y0, bar_y1)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+            self._draw_quad(x_val, bar_y0, x_zero, bar_y1, fill_color)
 
-        # green when correlated (safe, mono-compatible), red when
-        # anti-correlated (phase issue -- bass cancellation risk in mono)
-        if self.correlation < -0.3:
-            glUniform3f(self.color_loc, 0.9, 0.25, 0.2)
-        else:
-            glUniform3f(self.color_loc, 0.4, 0.8, 0.45)
-        glDrawArrays(GL_TRIANGLES, 0, 6)
+        self.text.draw(
+            f"CORR {self.correlation:+.2f}", 0.0, bar_y0 - 0.05, pixel_scale=1.4,
+            win_w=self.width, win_h=self.height, color=(0.8, 0.8, 0.85), align="center",
+        )
 
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
     def run(self):
@@ -218,5 +288,5 @@ class StereometerWindow:
 
 
 if __name__ == "__main__":
-    app = StereometerWindow()
+    app = VectorscopeWindow()
     app.run()
