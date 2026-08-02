@@ -1,15 +1,23 @@
 """
-Shared bitmap-font text rendering for the OpenGL visualizer modules.
+Shared text rendering for the OpenGL visualizer modules, backed by
+Windows GDI instead of a hand-rolled bitmap font.
 
-Originally written inline inside spectrum_analyzer.py (5x7 glyph bitmap,
-rasterized to a texture, drawn as a textured quad). Pulled out here so
-loudness.py can reuse the exact same font/renderer instead of copy-pasting
-~150 lines of glyph data -- there's no font file bundled with this
-from-scratch OpenGL pipeline, so this bitmap font is the only text
-rendering path available to any module.
+Previous version rasterized a manually-defined 5x7 glyph table (one
+entry per character, ~150 lines of "01110" strings). That only covered
+the handful of characters each module happened to need and had no
+anti-aliasing. This version renders text the same way any normal
+Windows app does -- CreateFontW + TextOutW into an in-memory DC -- and
+uploads the result as an alpha texture. Any character the system font
+supports works with no glyph table to maintain, and anti-aliasing comes
+for free from GDI's font rendering (ClearType/grayscale AA depending on
+system settings).
+
+Windows-only (GDI). This project is already Windows-only (WASAPI
+loopback in audio_capture.py), so that's not a new constraint.
 """
 
 import ctypes
+from ctypes import wintypes
 
 import numpy as np
 from OpenGL.GL import *
@@ -63,88 +71,140 @@ def link_program(vertex_src: str, fragment_src: str) -> int:
     return program
 
 
-# 5x7 bitmap font -- only the glyphs the app actually needs. Each glyph is
-# 7 row-strings (top to bottom), '1' = lit pixel. Uppercase letters were
-# added alongside the original lowercase set so panel titles like
-# "LOUDNESS" / "LEVEL L/R" can be rendered in caps, matching the reference.
-GLYPH_5X7 = {
-    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
-    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
-    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
-    "3": ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
-    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
-    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
-    "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
-    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
-    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
-    "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
-    ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
-    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
-    "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
-    "#": ["01010", "01010", "11111", "01010", "11111", "01010", "01010"],
-    ":": ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
-    "/": ["00001", "00001", "00010", "00100", "01000", "10000", "10000"],
-    "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
-    "z": ["00000", "00000", "11111", "00010", "00100", "01000", "11111"],
-    "k": ["10000", "10000", "10010", "10100", "11000", "10100", "10010"],
-    "d": ["00001", "00001", "01101", "10011", "10001", "10011", "01101"],
-    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
-    "C": ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
-    "n": ["00000", "00000", "10110", "11001", "10001", "10001", "10001"],
-    "t": ["01000", "01000", "11111", "01000", "01000", "01000", "00110"],
-    "s": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
-    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
-    "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
-    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
-    "e": ["00000", "00000", "01110", "10001", "11111", "10000", "01111"],
-    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
-    "G": ["01111", "10000", "10000", "10011", "10001", "10001", "01111"],
-    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
-    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-    "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
-    "N": ["10001", "11001", "10101", "10101", "10011", "10001", "10001"],
-    "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
-    "V": ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
-    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
-    "I": ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
-    "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
-    "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
-    "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
-    "K": ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
-    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
-}
+# ---------------------------------------------------------------------
+# GDI text-to-bitmap
+# ---------------------------------------------------------------------
+# Font size in actual rendered pixels for pixel_scale == 1.0. All
+# .draw() call sites pass a pixel_scale multiplier on top of this base
+# size (same role the old GLYPH_H=7 baseline used to play) -- existing
+# pixel_scale values in loudness.py / stereometer.py / spectrum_analyzer.py
+# were tuned for the old 7px-tall bitmap font and will read noticeably
+# larger now; they need re-tuning by eye, this is not a drop-in visual
+# match.
+BASE_FONT_PX = 14
+FONT_FACE = "Segoe UI"  # matches main.py's Tkinter launcher font
 
-GLYPH_W = 5
-GLYPH_H = 7
-GLYPH_PAD = 1  # 1px transparent padding column so adjacent glyphs don't touch
+gdi32 = ctypes.windll.gdi32
+user32 = ctypes.windll.user32
+
+# GDI constants
+DT_LEFT = 0x00000000
+DT_NOCLIP = 0x00000100
+DT_SINGLELINE = 0x00000020
+TRANSPARENT = 1
+DIB_RGB_COLORS = 0
+BI_RGB = 0
 
 
-def rasterize_text(text: str) -> np.ndarray:
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", BITMAPINFOHEADER),
+        ("bmiColors", wintypes.DWORD * 3),
+    ]
+
+
+def _measure_text(hdc, text: str) -> tuple[int, int]:
+    size = wintypes.SIZE()
+    gdi32.GetTextExtentPoint32W(hdc, text, len(text), ctypes.byref(size))
+    return max(1, size.cx), max(1, size.cy)
+
+
+def render_text_to_alpha(text: str, font_px: int) -> np.ndarray:
     """
-    Returns an (H, W) uint8 array (0 or 255) for the given string, glyphs
-    side by side with GLYPH_PAD empty columns between them. Unknown
-    characters render as blank space.
+    Renders `text` with GDI at the given pixel height and returns an
+    (H, W) uint8 grayscale array (0..255) suitable for use as an alpha
+    channel -- white text on black background, so pixel brightness
+    directly becomes glyph coverage. Unlike the old fixed 5x7 table,
+    this supports any character the chosen font face has a glyph for.
     """
-    cell_w = GLYPH_W + GLYPH_PAD
-    width = max(1, len(text) * cell_w)
-    height = GLYPH_H
-    canvas = np.zeros((height, width), dtype=np.uint8)
+    # 1) measure on a scratch DC to size the real one correctly
+    screen_dc = user32.GetDC(0)
+    measure_dc = gdi32.CreateCompatibleDC(screen_dc)
+    font = gdi32.CreateFontW(
+        -font_px, 0, 0, 0, 400, 0, 0, 0,
+        1,  # DEFAULT_CHARSET
+        0, 0,
+        4,  # CLEARTYPE_QUALITY (falls back gracefully if ClearType is off)
+        0,
+        FONT_FACE,
+    )
+    old_font = gdi32.SelectObject(measure_dc, font)
+    w, h = _measure_text(measure_dc, text)
+    gdi32.SelectObject(measure_dc, old_font)
+    gdi32.DeleteDC(measure_dc)
 
-    for i, ch in enumerate(text):
-        rows = GLYPH_5X7.get(ch, GLYPH_5X7[" "])
-        x0 = i * cell_w
-        for y, row in enumerate(rows):
-            for x, bit in enumerate(row):
-                if bit == "1":
-                    canvas[y, x0 + x] = 255
-    return canvas
+    # 2) create a top-down 24bpp DIB section sized to fit the text and
+    # paint the string into it in white on black
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h  # negative = top-down (row 0 = top row)
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 24
+    bmi.bmiHeader.biCompression = BI_RGB
+
+    dc = gdi32.CreateCompatibleDC(screen_dc)
+    bits_ptr = ctypes.c_void_p()
+    dib = gdi32.CreateDIBSection(
+        dc, ctypes.byref(bmi), DIB_RGB_COLORS, ctypes.byref(bits_ptr), None, 0
+    )
+    old_bmp = gdi32.SelectObject(dc, dib)
+    old_font = gdi32.SelectObject(dc, font)
+
+    gdi32.SetBkMode(dc, TRANSPARENT)
+    gdi32.SetTextColor(dc, 0x00FFFFFF)  # white text; background stays black
+    # black background: DIBs from CreateDIBSection aren't guaranteed
+    # zeroed on all systems, so paint it explicitly before drawing text
+    black_brush = gdi32.GetStockObject(4)  # BLACK_BRUSH
+    rect = wintypes.RECT(0, 0, w, h)
+    user32.FillRect(dc, ctypes.byref(rect), black_brush)
+
+    gdi32.TextOutW(dc, 0, 0, text, len(text))
+    gdi32.GdiFlush()
+
+    # row stride for 24bpp DIB rows is padded to a 4-byte boundary
+    stride = ((w * 3 + 3) // 4) * 4
+    buf = ctypes.cast(bits_ptr, ctypes.POINTER(ctypes.c_ubyte * (stride * h))).contents
+    raw = np.frombuffer(buf, dtype=np.uint8).reshape(h, stride)[:, : w * 3].reshape(h, w, 3)
+
+    # BGR -> single-channel coverage. Text was painted pure white on
+    # pure black with AA at the edges, so any one channel already
+    # carries the coverage value; take max across channels to be safe
+    # against ClearType's per-subpixel color fringing.
+    alpha = raw.max(axis=2).astype(np.uint8)
+
+    gdi32.SelectObject(dc, old_bmp)
+    gdi32.SelectObject(dc, old_font)
+    gdi32.DeleteObject(dib)
+    gdi32.DeleteDC(dc)
+    gdi32.DeleteObject(font)
+    user32.ReleaseDC(0, screen_dc)
+
+    return alpha
 
 
 class TextRenderer:
     """
-    Uploads one texture per unique string (cached by string) and draws it
-    as a textured quad at a given NDC position. Cache is small (a handful
-    of labels + readouts that change slowly relative to frame rate).
+    Uploads one texture per unique (string, font_px) pair (cached) and
+    draws it as a textured quad at a given NDC position. Cache is small
+    (a handful of labels + readouts that change slowly relative to
+    frame rate).
     """
 
     def __init__(self, program: int):
@@ -165,20 +225,21 @@ class TextRenderer:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        self._cache: dict[str, tuple[int, int, int]] = {}  # text -> (tex_id, w, h)
+        self._cache: dict[tuple[str, int], tuple[int, int, int]] = {}  # (text, font_px) -> (tex_id, w, h)
 
-    def _get_texture(self, text: str):
-        cached = self._cache.get(text)
+    def _get_texture(self, text: str, font_px: int):
+        key = (text, font_px)
+        cached = self._cache.get(key)
         if cached is not None:
             return cached
 
-        bitmap = rasterize_text(text)
+        bitmap = render_text_to_alpha(text, font_px)
         h, w = bitmap.shape
         tex = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, tex)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED, GL_UNSIGNED_BYTE,
@@ -186,22 +247,24 @@ class TextRenderer:
         glBindTexture(GL_TEXTURE_2D, 0)
 
         result = (tex, w, h)
-        self._cache[text] = result
+        self._cache[key] = result
         return result
 
     def draw(self, text: str, x_ndc: float, y_ndc: float, pixel_scale: float,
               win_w: int, win_h: int, color=(0.75, 0.75, 0.8), align: str = "left"):
         """
         Draws `text` with its top-left (or centered, if align='center') at
-        (x_ndc, y_ndc). pixel_scale = how many NDC-screen-pixels wide each
-        glyph pixel is (i.e. font size in real pixels).
+        (x_ndc, y_ndc). pixel_scale multiplies BASE_FONT_PX to get the
+        actual rendered font size in real pixels (e.g. pixel_scale=1.5
+        with BASE_FONT_PX=14 renders at 21px).
         """
         if not text:
             return
-        tex, w, h = self._get_texture(text)
+        font_px = max(1, round(BASE_FONT_PX * pixel_scale))
+        tex, w, h = self._get_texture(text, font_px)
 
-        ndc_w = (w * pixel_scale / win_w) * 2.0
-        ndc_h = (h * pixel_scale / win_h) * 2.0
+        ndc_w = (w / win_w) * 2.0
+        ndc_h = (h / win_h) * 2.0
 
         x0 = x_ndc - ndc_w / 2.0 if align == "center" else x_ndc
         x1 = x0 + ndc_w

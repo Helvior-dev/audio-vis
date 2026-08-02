@@ -5,10 +5,13 @@ reference app's naming).
 
 Core visualization (the Lissajous scatter plot) is unchanged from the
 original stereometer.py -- same Mid/Side transform, same point cloud.
-This pass only builds out the surrounding chrome to match the
-reference layout: title bar text, diagonal L/M/R/S guide lines with
-axis labels, and a labeled correlation readout ("corr 0.XX") instead
-of a bare color bar.
+This pass builds out the surrounding chrome to match the reference
+layout (title, diagonal L/MID/R/SIDE guide lines, correlation readout),
+plus: aspect-correct rendering so the diamond stays square when the
+window is maximized/fullscreen (GLFW's aspect-ratio hint only affects
+interactive resize, not maximize), a blanked title-bar icon, and a
+click-to-open help overlay explaining what the display and CORR value
+mean.
 """
 
 import sys
@@ -21,30 +24,34 @@ from OpenGL.GL import *
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from audio_capture import AudioCapture
-from window_utils import apply_dark_titlebar
+from window_utils import apply_dark_titlebar, remove_titlebar_icon
 from text_render import TextRenderer, TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, link_program as text_link_program
 
 HISTORY_POINTS = 1024  # how many recent samples are plotted as dots
 
-VERTEX_SHADER = """
-#version 330
-in vec2 pos;
-uniform vec2 offset;
-uniform float scale;
-void main() {
-    gl_Position = vec4(pos * scale + offset, 0.0, 1.0);
-}
-"""
+# how fast the displayed correlation eases toward the measured value
+# (per second, exponential) -- without this the readout and the bar
+# fill jitter frame-to-frame since corrcoef() is recomputed on every
+# small audio chunk
+CORR_SMOOTHING_PER_SEC = 6.0
 
-FRAGMENT_SHADER = """
-#version 330
-uniform vec3 color;
-uniform float alpha;
-out vec4 out_color;
-void main() {
-    out_color = vec4(color, alpha);
-}
-"""
+HELP_TEXT_LINES = [
+    "VECTORSCOPE",
+    "",
+    "Plots Mid (L+R, mono sum) against Side (L-R, stereo",
+    "difference) for the current audio. A narrow vertical",
+    "shape means mostly mono content; a wide round shape",
+    "means a wide stereo image.",
+    "",
+    "CORR -- L/R CORRELATION",
+    "",
+    "+1.00  identical channels (mono)",
+    " 0.00  fully independent channels (wide stereo)",
+    "-1.00  out of phase (L = -R); sums to silence in mono,",
+    "       usually a mixing problem",
+    "",
+    "Click anywhere to close",
+]
 
 
 def compile_shader(source: str, shader_type) -> int:
@@ -72,6 +79,41 @@ def link_program(vertex_src: str, fragment_src: str) -> int:
     return program
 
 
+# Vertex shader now applies an aspect-correction scale on top of the
+# existing offset/scale uniforms. GLFW's set_window_aspect_ratio() hint
+# only constrains interactive corner-dragging -- maximizing the window
+# (fullscreen / Win+Up) bypasses it entirely, so the framebuffer can end
+# up non-square (e.g. a 1920x1000 client area). Without correction, a
+# shape built in NDC units (-1..1 on both axes) stretches to fill that
+# non-square area and the diamond becomes an ellipse. aspect_scale is
+# computed every frame as (min(w,h)/w, min(h,w)/h) so the same NDC
+# square always maps to actual on-screen pixels regardless of window
+# shape -- fitting the largest centered square in whatever the client
+# area is, matching how the diamond field looked at the original 1:1
+# window size.
+VERTEX_SHADER = """
+#version 330
+in vec2 pos;
+uniform vec2 offset;
+uniform float scale;
+uniform vec2 aspect_scale;
+void main() {
+    vec2 p = pos * scale * aspect_scale + offset * aspect_scale;
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+"""
+
+FRAGMENT_SHADER = """
+#version 330
+uniform vec3 color;
+uniform float alpha;
+out vec4 out_color;
+void main() {
+    out_color = vec4(color, alpha);
+}
+"""
+
+
 class VectorscopeWindow:
     def __init__(self):
         if not glfw.init():
@@ -93,20 +135,22 @@ class VectorscopeWindow:
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
         glfw.set_framebuffer_size_callback(self.window, self._on_resize)
-        # lock resize to a 1:1 aspect ratio -- without this, dragging a
-        # corner unevenly would stretch the diamond grid into an ellipse
+        glfw.set_mouse_button_callback(self.window, self._on_mouse_button)
+        glfw.set_cursor_pos_callback(self.window, self._on_cursor_move)
+        # kept as a hint for interactive corner-dragging; maximize/fullscreen
+        # bypasses this, which is why aspect_scale exists in the shader too
         glfw.set_window_aspect_ratio(self.window, 1, 1)
         apply_dark_titlebar(self.window)
+        remove_titlebar_icon(self.window)
 
         self.program = link_program(VERTEX_SHADER, FRAGMENT_SHADER)
         self.color_loc = glGetUniformLocation(self.program, "color")
         self.alpha_loc = glGetUniformLocation(self.program, "alpha")
         self.offset_loc = glGetUniformLocation(self.program, "offset")
         self.scale_loc = glGetUniformLocation(self.program, "scale")
+        self.aspect_loc = glGetUniformLocation(self.program, "aspect_scale")
 
-        # text rendering (title, axis labels, corr readout) -- separate
-        # program since it samples a glyph-atlas texture instead of
-        # taking a flat color uniform
+        # text rendering (title, axis labels, corr readout, help overlay)
         self.text_program = text_link_program(TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER)
         self.text = TextRenderer(self.text_program)
 
@@ -123,13 +167,16 @@ class VectorscopeWindow:
         glBindVertexArray(0)
         glPointSize(2.0)
 
-        # generic dynamic-quad/line VBO reused for: correlation bar,
-        # diagonal guide lines, background track
+        # generic dynamic-quad/line VAO/VBO reused for: correlation bar,
+        # diagonal guide lines, background track, help icon, help panel.
+        # Sized for the largest thing ever written here (the help-icon
+        # circle, 24 segments = 192 bytes) -- quads/lines only use the
+        # first 6 or 2 vertices of this same buffer.
         self.line_vao = glGenVertexArrays(1)
         glBindVertexArray(self.line_vao)
         self.line_vbo = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
-        glBufferData(GL_ARRAY_BUFFER, 6 * 2 * 4, None, GL_DYNAMIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, 32 * 2 * 4, None, GL_DYNAMIC_DRAW)
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
         glBindBuffer(GL_ARRAY_BUFFER, 0)
@@ -140,13 +187,67 @@ class VectorscopeWindow:
 
         self.audio = AudioCapture(chunk_size=256)
         self.points = np.zeros((HISTORY_POINTS, 2), dtype=np.float32)
-        self.correlation = 0.0
+        self.correlation = 0.0          # raw measured value, updated every chunk
+        self.displayed_correlation = 0.0  # eased value actually drawn
+        self.last_time = glfw.get_time()
+
+        # help icon position/size, in NDC of the *square* aspect-corrected
+        # space (same space everything else draws in) -- top-right corner
+        self.help_icon_cx = 0.90
+        self.help_icon_cy = 0.92
+        self.help_icon_r = 0.045
+        self.help_open = False
+        self.mouse_x, self.mouse_y = -1.0, -1.0
 
     def _on_resize(self, window, width, height):
         self.width, self.height = width, height
         glViewport(0, 0, width, height)
 
+    def _on_cursor_move(self, window, xpos, ypos):
+        self.mouse_x, self.mouse_y = xpos, ypos
+
+    def _mouse_to_square_ndc(self, xpos, ypos):
+        """
+        Converts a raw framebuffer mouse position into the same
+        aspect-corrected NDC space everything is drawn in (see
+        VERTEX_SHADER's aspect_scale) -- i.e. the space where (-1,-1) to
+        (1,1) is the largest centered square in the window regardless of
+        the window's actual (possibly non-square) shape.
+        """
+        if self.width <= 0 or self.height <= 0:
+            return 0.0, 0.0
+        raw_x = (xpos / self.width) * 2.0 - 1.0
+        raw_y = 1.0 - (ypos / self.height) * 2.0
+        min_dim = min(self.width, self.height)
+        ax = min_dim / self.width
+        ay = min_dim / self.height
+        # inverse of the shader's forward transform (p = pos * aspect_scale)
+        return raw_x / ax, raw_y / ay
+
+    def _on_mouse_button(self, window, button, action, mods):
+        if button != glfw.MOUSE_BUTTON_LEFT or action != glfw.PRESS:
+            return
+        if self.help_open:
+            # any click closes the overlay
+            self.help_open = False
+            return
+        x, y = self._mouse_to_square_ndc(self.mouse_x, self.mouse_y)
+        dx = x - self.help_icon_cx
+        dy = y - self.help_icon_cy
+        if dx * dx + dy * dy <= self.help_icon_r * self.help_icon_r:
+            self.help_open = True
+
+    def _aspect_scale(self):
+        min_dim = min(self.width, self.height)
+        if self.width <= 0 or self.height <= 0:
+            return 1.0, 1.0
+        return min_dim / self.width, min_dim / self.height
+
     def _update_audio(self):
+        now = glfw.get_time()
+        dt = max(1e-4, now - self.last_time)
+        self.last_time = now
+
         chunk = self.audio.read_chunk()  # (N, 2)
         left = chunk[:, 0]
         right = chunk[:, 1]
@@ -167,14 +268,26 @@ class VectorscopeWindow:
             corr = np.corrcoef(left, right)[0, 1]
             self.correlation = float(np.clip(corr, -1.0, 1.0))
 
+        # exponential smoothing toward the raw measured value, same
+        # ballistics style as vu.py / loudness.py -- keeps the bar and
+        # numeric readout from jittering every audio chunk
+        max_step = CORR_SMOOTHING_PER_SEC * dt
+        diff = self.correlation - self.displayed_correlation
+        if abs(diff) <= max_step:
+            self.displayed_correlation = self.correlation
+        else:
+            self.displayed_correlation += max_step if diff > 0 else -max_step
+
     def _quad_verts(self, x0, x1, y0, y1) -> np.ndarray:
         return np.array(
             [x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1], dtype=np.float32
         )
 
     def _draw_line(self, x0, y0, x1, y1, color, alpha=1.0, width=1.0):
+        ax, ay = self._aspect_scale()
         glUniform2f(self.offset_loc, 0.0, 0.0)
         glUniform1f(self.scale_loc, 1.0)
+        glUniform2f(self.aspect_loc, ax, ay)
         glUniform3f(self.color_loc, *color)
         glUniform1f(self.alpha_loc, alpha)
         glLineWidth(width)
@@ -184,14 +297,82 @@ class VectorscopeWindow:
         glDrawArrays(GL_LINES, 0, 2)
 
     def _draw_quad(self, x0, y0, x1, y1, color, alpha=1.0):
+        ax, ay = self._aspect_scale()
         glUniform2f(self.offset_loc, 0.0, 0.0)
         glUniform1f(self.scale_loc, 1.0)
+        glUniform2f(self.aspect_loc, ax, ay)
         glUniform3f(self.color_loc, *color)
         glUniform1f(self.alpha_loc, alpha)
         verts = self._quad_verts(x0, x1, y0, y1)
         glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
         glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
         glDrawArrays(GL_TRIANGLES, 0, 6)
+
+    def _draw_circle(self, cx, cy, r, color, alpha=1.0, segments=24):
+        ax, ay = self._aspect_scale()
+        glUniform2f(self.offset_loc, cx, cy)
+        glUniform1f(self.scale_loc, r)
+        glUniform2f(self.aspect_loc, ax, ay)
+        glUniform3f(self.color_loc, *color)
+        glUniform1f(self.alpha_loc, alpha)
+        angles = np.linspace(0, 2 * np.pi, segments, endpoint=True, dtype=np.float32)
+        verts = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
+        glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+        glDrawArrays(GL_LINE_STRIP, 0, segments)
+
+    def _text_square(self, s, x_ndc, y_ndc, scale, color, align="left"):
+        """
+        Draws text positioned in the same aspect-corrected square NDC
+        space everything else uses, instead of raw window NDC. Needed
+        because TextRenderer.draw() sizes glyphs from win_w/win_h
+        directly (real pixels), so on a non-square window we pass the
+        square's actual on-screen pixel extent (min(width,height)) for
+        sizing, but keep window width/height for converting that pixel
+        size back into this window's NDC range.
+        """
+        ax, ay = self._aspect_scale()
+        min_dim = min(self.width, self.height)
+        # position: square NDC -> window NDC
+        x_win = x_ndc * ax
+        y_win = y_ndc * ay
+        # size glyphs relative to the square's pixel size, then express
+        # that as window NDC by using min_dim as both win_w/win_h --
+        # TextRenderer.draw()'s ndc_w/ndc_h math is (pixels/win_dim)*2,
+        # so passing min_dim for both keeps glyph pixel size constant
+        # regardless of window aspect, matching the square content.
+        self.text.draw(s, x_win, y_win, pixel_scale=scale,
+                        win_w=min_dim, win_h=min_dim, color=color, align=align)
+
+    def _draw_help_icon(self):
+        hovering = False
+        x, y = self._mouse_to_square_ndc(self.mouse_x, self.mouse_y)
+        dx, dy = x - self.help_icon_cx, y - self.help_icon_cy
+        if dx * dx + dy * dy <= self.help_icon_r * self.help_icon_r:
+            hovering = True
+
+        glUseProgram(self.program)
+        glBindVertexArray(self.line_vao)
+        icon_color = (0.75, 0.75, 0.8) if hovering else (0.5, 0.5, 0.55)
+        self._draw_circle(self.help_icon_cx, self.help_icon_cy, self.help_icon_r, icon_color, alpha=0.9)
+
+        self._text_square("?", self.help_icon_cx, self.help_icon_cy + 0.018, 1.1,
+                           icon_color, align="center")
+
+    def _draw_help_overlay(self):
+        glUseProgram(self.program)
+        glBindVertexArray(self.line_vao)
+        # dim the whole scene, then a centered panel on top
+        self._draw_quad(-1.0, -1.0, 1.0, 1.0, (0.0, 0.0, 0.0), alpha=0.72)
+        self._draw_quad(-0.88, -0.72, 0.88, 0.72, (0.08, 0.08, 0.1), alpha=0.97)
+
+        line_h = 0.085
+        start_y = 0.60
+        for i, line in enumerate(HELP_TEXT_LINES):
+            color = (0.9, 0.9, 0.95) if (i == 0 or line.startswith("CORR")) else (0.68, 0.68, 0.73)
+            scale = 1.3 if (i == 0 or line.startswith("CORR")) else 1.0
+            if line:
+                self._text_square(line, -0.80, start_y - i * line_h, scale, color, align="left")
 
     def render_frame(self):
         glClearColor(0.03, 0.03, 0.04, 1.0)
@@ -202,11 +383,13 @@ class VectorscopeWindow:
         # ---- vectorscope field layout ----
         # the scatter field is a square centered in the upper ~75% of the
         # window; correlation bar sits in a separate strip at the bottom,
-        # matching the reference screenshot's proportions
+        # matching the reference screenshot's proportions. All of this is
+        # in "square NDC" -- see aspect_scale in the shader -- so it stays
+        # a true diamond even when the window itself isn't square.
         field_cy = 0.18     # NDC y-center of the diamond field
         field_scale = 0.62  # NDC half-size of the diamond
 
-        # diagonal guide lines forming the diamond (L-M-R-S axes), dim
+        # diagonal guide lines forming the diamond (L-MID-R-SIDE axes), dim
         diag_color = (0.28, 0.30, 0.34)
         self._draw_line(-field_scale, field_cy, 0.0, field_cy + field_scale, diag_color, alpha=0.8)
         self._draw_line(0.0, field_cy + field_scale, field_scale, field_cy, diag_color, alpha=0.8)
@@ -214,8 +397,10 @@ class VectorscopeWindow:
         self._draw_line(0.0, field_cy - field_scale, -field_scale, field_cy, diag_color, alpha=0.8)
 
         # ---- scatter points (untouched core visualization) ----
+        ax, ay = self._aspect_scale()
         glUniform2f(self.offset_loc, 0.0, field_cy)
         glUniform1f(self.scale_loc, field_scale * 0.9)
+        glUniform2f(self.aspect_loc, ax, ay)
         glUniform3f(self.color_loc, 0.6, 0.85, 0.95)  # original stereometer.py color, unchanged
         glUniform1f(self.alpha_loc, 0.8)
 
@@ -225,28 +410,19 @@ class VectorscopeWindow:
         glDrawArrays(GL_POINTS, 0, HISTORY_POINTS)
         glBindVertexArray(self.line_vao)  # switch back for the rest of this frame
 
-        # ---- axis labels: L / M / R / S at the four diamond tips ----
+        # ---- axis labels: L / MID / R / SIDE at the four diamond tips ----
         label_color = (0.55, 0.55, 0.6)
         label_offset = field_scale + 0.09
-        self.text.draw("L", -label_offset, field_cy + 0.03, pixel_scale=1.6,
-                        win_w=self.width, win_h=self.height, color=label_color, align="center")
-        self.text.draw("M", -0.0, field_cy + field_scale + 0.10, pixel_scale=1.6,
-                        win_w=self.width, win_h=self.height, color=label_color, align="center")
-        self.text.draw("R", label_offset, field_cy + 0.03, pixel_scale=1.6,
-                        win_w=self.width, win_h=self.height, color=label_color, align="center")
-        self.text.draw("S", -0.0, field_cy - field_scale - 0.02, pixel_scale=1.6,
-                        win_w=self.width, win_h=self.height, color=label_color, align="center")
-        # second "S" tag near the right diagonal, matching the reference's
-        # two-S layout (S appears at both side-channel extremes)
-        self.text.draw("S", label_offset - 0.03, field_cy - 0.11, pixel_scale=1.2,
-                        win_w=self.width, win_h=self.height, color=label_color, align="center")
+        self._text_square("L", -label_offset, field_cy + 0.03, 1.6, label_color, align="center")
+        self._text_square("MID", 0.0, field_cy + field_scale + 0.10, 1.4, label_color, align="center")
+        self._text_square("R", label_offset, field_cy + 0.03, 1.6, label_color, align="center")
+        self._text_square("SIDE", 0.0, field_cy - field_scale - 0.02, 1.4, label_color, align="center")
 
         glUseProgram(self.program)
         glBindVertexArray(self.line_vao)
 
-        # ---- title, top-left ----
-        self.text.draw("STEREOMETER", -0.94, 0.92, pixel_scale=1.5,
-                        win_w=self.width, win_h=self.height, color=(0.85, 0.85, 0.9))
+        # ---- title, top-left -- slightly smaller than before (was 1.5) ----
+        self._text_square("STEREOMETER", -0.94, 0.92, 1.15, (0.85, 0.85, 0.9))
 
         # text.draw() switches to text_program internally -- must restore
         # self.program before issuing more glUniform*/glDrawArrays calls
@@ -256,22 +432,30 @@ class VectorscopeWindow:
         glBindVertexArray(self.line_vao)
 
         # ---- correlation bar + numeric readout, bottom ----
-        bar_y0, bar_y1 = -0.86, -0.80
+        # both driven by displayed_correlation (eased), not the raw
+        # per-chunk measurement, so the fill and text move smoothly.
+        # Moved up from -0.86/-0.80 so it sits further from the bottom
+        # edge / closer to the diamond, per feedback.
+        bar_y0, bar_y1 = -0.74, -0.68
         bar_x0, bar_x1 = -0.7, 0.7
         self._draw_quad(bar_x0, bar_y0, bar_x1, bar_y1, (0.14, 0.14, 0.17))  # track
 
         x_zero = 0.0
-        x_val = (self.correlation * 0.9) * ((bar_x1 - bar_x0) / 2)
-        fill_color = (0.35, 0.75, 0.95) if self.correlation >= -0.3 else (0.9, 0.25, 0.2)
-        if self.correlation >= 0:
+        x_val = (self.displayed_correlation * 0.9) * ((bar_x1 - bar_x0) / 2)
+        fill_color = (0.35, 0.75, 0.95) if self.displayed_correlation >= -0.3 else (0.9, 0.25, 0.2)
+        if self.displayed_correlation >= 0:
             self._draw_quad(x_zero, bar_y0, x_val, bar_y1, fill_color)
         else:
             self._draw_quad(x_val, bar_y0, x_zero, bar_y1, fill_color)
 
-        self.text.draw(
-            f"CORR {self.correlation:+.2f}", 0.0, bar_y0 - 0.05, pixel_scale=1.4,
-            win_w=self.width, win_h=self.height, color=(0.8, 0.8, 0.85), align="center",
+        self._text_square(
+            f"CORR {self.displayed_correlation:+.2f}", 0.0, bar_y0 - 0.05, 1.4,
+            (0.8, 0.8, 0.85), align="center",
         )
+
+        self._draw_help_icon()
+        if self.help_open:
+            self._draw_help_overlay()
 
         glBindVertexArray(0)
 

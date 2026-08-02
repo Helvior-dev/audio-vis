@@ -19,6 +19,12 @@ import glfw
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19  # pre-20H1 builds used this value
 
+WM_SETICON = 0x0080
+ICON_SMALL = 0
+ICON_BIG = 1
+GCLP_HICON = -14
+GCLP_HICONSM = -34
+
 
 def _set_dark_mode(hwnd: int) -> None:
     """Low-level: flip the DWM dark-titlebar attribute for a raw HWND."""
@@ -34,12 +40,42 @@ def _set_dark_mode(hwnd: int) -> None:
             break  # succeeded, no need to try the fallback attribute id
 
 
+def _remove_icon(hwnd: int) -> None:
+    """
+    Low-level: strip the title-bar/taskbar icon for a raw HWND.
+
+    glfw.set_window_icon(window, 0, []) is not reliable here -- GLFW's
+    "clear icon" path only resets to whatever icon the OS considers
+    default for the window class, it doesn't guarantee no icon shows.
+    Sending WM_SETICON with a NULL HICON directly is what every native
+    Win32 app uses to actually blank the icon slot, for both the small
+    (title bar) and big (Alt-Tab/taskbar) icon.
+    """
+    if not hwnd:
+        return
+    user32 = ctypes.windll.user32
+    user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, 0)
+    user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, 0)
+    # also clear the window-class icon -- some Windows builds fall back
+    # to this if WM_SETICON's per-window value is unset
+    user32.SetClassLongPtrW(hwnd, GCLP_HICON, 0)
+    user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, 0)
+
+
 def apply_dark_titlebar(window) -> None:
     """For GLFW windows (the visualizer modules)."""
     if sys.platform != "win32":
         return
     hwnd = glfw.get_win32_window(window)
     _set_dark_mode(hwnd)
+
+
+def remove_titlebar_icon(window) -> None:
+    """For GLFW windows -- blanks the title bar / taskbar icon."""
+    if sys.platform != "win32":
+        return
+    hwnd = glfw.get_win32_window(window)
+    _remove_icon(hwnd)
 
 
 def apply_dark_titlebar_tk(root) -> None:
