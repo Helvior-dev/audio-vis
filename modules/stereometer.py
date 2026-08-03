@@ -12,6 +12,17 @@ window is maximized/fullscreen (GLFW's aspect-ratio hint only affects
 interactive resize, not maximize), a blanked title-bar icon, and a
 click-to-open help overlay explaining what the display and CORR value
 mean.
+
+Two coordinate spaces are used:
+  - "square" space (aspect_scale applied): the diamond, its axis labels,
+    and the CORR bar all live here, centered in the largest square that
+    fits the window -- this is what keeps the diamond a true diamond
+    instead of an ellipse when the window isn't square.
+  - "window" space (aspect_scale = 1,1): UI chrome that should use the
+    window's actual edges -- the title and the help icon/overlay --
+    lives here. On a wide monitor the square is much narrower than the
+    window, so chrome anchored to the square's edges would bunch up
+    near the center instead of sitting at the window's real corners.
 """
 
 import sys
@@ -47,8 +58,8 @@ HELP_TEXT_LINES = [
     "",
     "+1.00  identical channels (mono)",
     " 0.00  fully independent channels (wide stereo)",
-    "-1.00  out of phase (L = -R); sums to silence in mono,",
-    "       usually a mixing problem",
+    "-1.00  out of phase (L = -R); sums to silence",
+    "       in mono, usually a mixing problem",
     "",
     "Click anywhere to close",
 ]
@@ -79,18 +90,12 @@ def link_program(vertex_src: str, fragment_src: str) -> int:
     return program
 
 
-# Vertex shader now applies an aspect-correction scale on top of the
+# Vertex shader applies an aspect-correction scale on top of the
 # existing offset/scale uniforms. GLFW's set_window_aspect_ratio() hint
 # only constrains interactive corner-dragging -- maximizing the window
 # (fullscreen / Win+Up) bypasses it entirely, so the framebuffer can end
-# up non-square (e.g. a 1920x1000 client area). Without correction, a
-# shape built in NDC units (-1..1 on both axes) stretches to fill that
-# non-square area and the diamond becomes an ellipse. aspect_scale is
-# computed every frame as (min(w,h)/w, min(h,w)/h) so the same NDC
-# square always maps to actual on-screen pixels regardless of window
-# shape -- fitting the largest centered square in whatever the client
-# area is, matching how the diamond field looked at the original 1:1
-# window size.
+# up non-square. aspect_scale = (1,1) draws in raw window NDC; any other
+# value draws in the centered-square space the diamond uses.
 VERTEX_SHADER = """
 #version 330
 in vec2 pos;
@@ -191,11 +196,11 @@ class VectorscopeWindow:
         self.displayed_correlation = 0.0  # eased value actually drawn
         self.last_time = glfw.get_time()
 
-        # help icon position/size, in NDC of the *square* aspect-corrected
-        # space (same space everything else draws in) -- top-right corner
-        self.help_icon_cx = 0.90
-        self.help_icon_cy = 0.92
-        self.help_icon_r = 0.045
+        # help icon position/size, in WINDOW NDC (real screen edges, not
+        # the diamond's square) -- top-right corner
+        self.help_icon_cx = 0.93
+        self.help_icon_cy = 0.95
+        self.help_icon_r = 0.035
         self.help_open = False
         self.mouse_x, self.mouse_y = -1.0, -1.0
 
@@ -208,11 +213,10 @@ class VectorscopeWindow:
 
     def _mouse_to_square_ndc(self, xpos, ypos):
         """
-        Converts a raw framebuffer mouse position into the same
-        aspect-corrected NDC space everything is drawn in (see
-        VERTEX_SHADER's aspect_scale) -- i.e. the space where (-1,-1) to
-        (1,1) is the largest centered square in the window regardless of
-        the window's actual (possibly non-square) shape.
+        Converts a raw framebuffer mouse position into the aspect-
+        corrected square NDC space the diamond diagram uses -- i.e. the
+        space where (-1,-1) to (1,1) is the largest centered square in
+        the window regardless of the window's actual shape.
         """
         if self.width <= 0 or self.height <= 0:
             return 0.0, 0.0
@@ -224,6 +228,15 @@ class VectorscopeWindow:
         # inverse of the shader's forward transform (p = pos * aspect_scale)
         return raw_x / ax, raw_y / ay
 
+    def _mouse_to_window_ndc(self, xpos, ypos):
+        """Raw window NDC (no square correction) -- for hit-testing UI
+        chrome that's drawn with _draw_*_window() / _text_window()."""
+        if self.width <= 0 or self.height <= 0:
+            return 0.0, 0.0
+        x = (xpos / self.width) * 2.0 - 1.0
+        y = 1.0 - (ypos / self.height) * 2.0
+        return x, y
+
     def _on_mouse_button(self, window, button, action, mods):
         if button != glfw.MOUSE_BUTTON_LEFT or action != glfw.PRESS:
             return
@@ -231,7 +244,7 @@ class VectorscopeWindow:
             # any click closes the overlay
             self.help_open = False
             return
-        x, y = self._mouse_to_square_ndc(self.mouse_x, self.mouse_y)
+        x, y = self._mouse_to_window_ndc(self.mouse_x, self.mouse_y)
         dx = x - self.help_icon_cx
         dy = y - self.help_icon_cy
         if dx * dx + dy * dy <= self.help_icon_r * self.help_icon_r:
@@ -296,6 +309,51 @@ class VectorscopeWindow:
         glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
         glDrawArrays(GL_LINES, 0, 2)
 
+    def _draw_quad_window(self, x0, y0, x1, y1, color, alpha=1.0):
+        """
+        Same as _draw_quad but in real window NDC (aspect_scale = 1,1,
+        no squaring). Used for UI chrome -- title, CORR bar, help
+        icon/overlay -- that should use the window's full width instead
+        of being confined to the centered square the diamond lives in.
+        On a wide monitor the square is much narrower than the window,
+        so UI anchored to its edges would bunch up near the center
+        instead of sitting at the window's actual corners/edges.
+        """
+        glUniform2f(self.offset_loc, 0.0, 0.0)
+        glUniform1f(self.scale_loc, 1.0)
+        glUniform2f(self.aspect_loc, 1.0, 1.0)
+        glUniform3f(self.color_loc, *color)
+        glUniform1f(self.alpha_loc, alpha)
+        verts = self._quad_verts(x0, x1, y0, y1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+
+    def _draw_circle_window(self, cx, cy, r, color, alpha=1.0, segments=24):
+        """Window-NDC counterpart of _draw_circle, see _draw_quad_window."""
+        glUniform2f(self.offset_loc, cx, cy)
+        glUniform1f(self.scale_loc, r)
+        glUniform2f(self.aspect_loc, 1.0, 1.0)
+        glUniform3f(self.color_loc, *color)
+        glUniform1f(self.alpha_loc, alpha)
+        angles = np.linspace(0, 2 * np.pi, segments, endpoint=True, dtype=np.float32)
+        verts = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
+        glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+        glDrawArrays(GL_LINE_STRIP, 0, segments)
+
+    def _text_window(self, s, x_ndc, y_ndc, scale, color, align="left"):
+        """
+        Window-NDC counterpart of _text_square -- draws directly in the
+        window's own NDC space using the real win_w/win_h, instead of
+        the centered-square space the diamond diagram uses. Font size
+        still scales with window height via TextRenderer.draw()'s own
+        win_h-based sizing, so text stays proportional to the window,
+        it just isn't confined to the square's footprint.
+        """
+        self.text.draw(s, x_ndc, y_ndc, pixel_scale=scale,
+                        win_w=self.width, win_h=self.height, color=color, align=align)
+
     def _draw_quad(self, x0, y0, x1, y1, color, alpha=1.0):
         ax, ay = self._aspect_scale()
         glUniform2f(self.offset_loc, 0.0, 0.0)
@@ -323,13 +381,12 @@ class VectorscopeWindow:
 
     def _text_square(self, s, x_ndc, y_ndc, scale, color, align="left"):
         """
-        Draws text positioned in the same aspect-corrected square NDC
-        space everything else uses, instead of raw window NDC. Needed
-        because TextRenderer.draw() sizes glyphs from win_w/win_h
-        directly (real pixels), so on a non-square window we pass the
-        square's actual on-screen pixel extent (min(width,height)) for
-        sizing, but keep window width/height for converting that pixel
-        size back into this window's NDC range.
+        Draws text positioned in the aspect-corrected square NDC space
+        the diamond diagram uses. Needed because TextRenderer.draw()
+        sizes glyphs from win_w/win_h directly (real pixels), so on a
+        non-square window we pass the square's actual on-screen pixel
+        extent (min(width,height)) for sizing, but keep window width/
+        height for converting that pixel size back into NDC.
         """
         ax, ay = self._aspect_scale()
         min_dim = min(self.width, self.height)
@@ -346,7 +403,7 @@ class VectorscopeWindow:
 
     def _draw_help_icon(self):
         hovering = False
-        x, y = self._mouse_to_square_ndc(self.mouse_x, self.mouse_y)
+        x, y = self._mouse_to_window_ndc(self.mouse_x, self.mouse_y)
         dx, dy = x - self.help_icon_cx, y - self.help_icon_cy
         if dx * dx + dy * dy <= self.help_icon_r * self.help_icon_r:
             hovering = True
@@ -354,25 +411,28 @@ class VectorscopeWindow:
         glUseProgram(self.program)
         glBindVertexArray(self.line_vao)
         icon_color = (0.75, 0.75, 0.8) if hovering else (0.5, 0.5, 0.55)
-        self._draw_circle(self.help_icon_cx, self.help_icon_cy, self.help_icon_r, icon_color, alpha=0.9)
+        self._draw_circle_window(self.help_icon_cx, self.help_icon_cy, self.help_icon_r, icon_color, alpha=0.9)
 
-        self._text_square("?", self.help_icon_cx, self.help_icon_cy + 0.018, 1.1,
+        self._text_window("?", self.help_icon_cx, self.help_icon_cy + 0.018, 1.1,
                            icon_color, align="center")
 
     def _draw_help_overlay(self):
         glUseProgram(self.program)
         glBindVertexArray(self.line_vao)
-        # dim the whole scene, then a centered panel on top
-        self._draw_quad(-1.0, -1.0, 1.0, 1.0, (0.0, 0.0, 0.0), alpha=0.72)
-        self._draw_quad(-0.88, -0.72, 0.88, 0.72, (0.08, 0.08, 0.1), alpha=0.97)
+        # dim the whole scene, then a near-fullscreen panel on top --
+        # all in window space, so it always covers the actual window
+        # and the text uses the window's real width rather than being
+        # squeezed into the (possibly much narrower) diamond's square.
+        self._draw_quad_window(-1.0, -1.0, 1.0, 1.0, (0.0, 0.0, 0.0), alpha=0.72)
+        self._draw_quad_window(-0.95, -0.85, 0.95, 0.85, (0.08, 0.08, 0.1), alpha=0.97)
 
-        line_h = 0.085
-        start_y = 0.60
+        line_h = 0.075
+        start_y = 0.68
         for i, line in enumerate(HELP_TEXT_LINES):
             color = (0.9, 0.9, 0.95) if (i == 0 or line.startswith("CORR")) else (0.68, 0.68, 0.73)
-            scale = 1.3 if (i == 0 or line.startswith("CORR")) else 1.0
+            scale = 1.15 if (i == 0 or line.startswith("CORR")) else 0.85
             if line:
-                self._text_square(line, -0.80, start_y - i * line_h, scale, color, align="left")
+                self._text_window(line, -0.88, start_y - i * line_h, scale, color, align="left")
 
     def render_frame(self):
         glClearColor(0.03, 0.03, 0.04, 1.0)
@@ -421,8 +481,10 @@ class VectorscopeWindow:
         glUseProgram(self.program)
         glBindVertexArray(self.line_vao)
 
-        # ---- title, top-left -- slightly smaller than before (was 1.5) ----
-        self._text_square("STEREOMETER", -0.94, 0.92, 1.15, (0.85, 0.85, 0.9))
+        # ---- title, top-left -- window space, not square space, so it
+        # sits at the window's actual corner on wide monitors instead of
+        # bunching toward the center of a narrower diamond square ----
+        self._text_window("STEREOMETER", -0.94, 0.92, 1.15, (0.85, 0.85, 0.9))
 
         # text.draw() switches to text_program internally -- must restore
         # self.program before issuing more glUniform*/glDrawArrays calls
@@ -434,8 +496,9 @@ class VectorscopeWindow:
         # ---- correlation bar + numeric readout, bottom ----
         # both driven by displayed_correlation (eased), not the raw
         # per-chunk measurement, so the fill and text move smoothly.
-        # Moved up from -0.86/-0.80 so it sits further from the bottom
-        # edge / closer to the diamond, per feedback.
+        # Kept in square space -- it reads as part of the diamond's own
+        # composition, so it should scale/center with the diamond
+        # rather than stretch across the full window width.
         bar_y0, bar_y1 = -0.74, -0.68
         bar_x0, bar_x1 = -0.7, 0.7
         self._draw_quad(bar_x0, bar_y0, bar_x1, bar_y1, (0.14, 0.14, 0.17))  # track

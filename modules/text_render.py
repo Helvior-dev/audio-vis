@@ -2,15 +2,19 @@
 Shared text rendering for the OpenGL visualizer modules, backed by
 Windows GDI instead of a hand-rolled bitmap font.
 
-Previous version rasterized a manually-defined 5x7 glyph table (one
-entry per character, ~150 lines of "01110" strings). That only covered
-the handful of characters each module happened to need and had no
-anti-aliasing. This version renders text the same way any normal
-Windows app does -- CreateFontW + TextOutW into an in-memory DC -- and
-uploads the result as an alpha texture. Any character the system font
-supports works with no glyph table to maintain, and anti-aliasing comes
-for free from GDI's font rendering (ClearType/grayscale AA depending on
-system settings).
+Font size is resolved to actual on-screen pixels every draw() call
+(via win_h, which every caller already passes in) rather than a fixed
+constant. Earlier versions rendered the GDI bitmap once at a constant
+pixel height and then stretched that same texture over whatever quad
+size the NDC coordinates worked out to. That's fine at the window size
+it was tuned for, but the moment the window is resized larger (maximize
+/ fullscreen), the same fixed-resolution texture gets magnified well
+past its native size and comes out visibly blurry -- vector-drawn
+shapes (the diamond, bars) stay crisp because the GPU rasterizes them
+fresh every frame at whatever resolution, but a bitmap texture doesn't
+get that for free. Resolving font_px from win_h means the GDI bitmap is
+always rendered near its final on-screen size, so it stays sharp at
+any window size.
 
 Windows-only (GDI). This project is already Windows-only (WASAPI
 loopback in audio_capture.py), so that's not a new constraint.
@@ -71,26 +75,18 @@ def link_program(vertex_src: str, fragment_src: str) -> int:
     return program
 
 
-# ---------------------------------------------------------------------
-# GDI text-to-bitmap
-# ---------------------------------------------------------------------
-# Font size in actual rendered pixels for pixel_scale == 1.0. All
-# .draw() call sites pass a pixel_scale multiplier on top of this base
-# size (same role the old GLYPH_H=7 baseline used to play) -- existing
-# pixel_scale values in loudness.py / stereometer.py / spectrum_analyzer.py
-# were tuned for the old 7px-tall bitmap font and will read noticeably
-# larger now; they need re-tuning by eye, this is not a drop-in visual
-# match.
-BASE_FONT_PX = 14
+# pixel_scale historically meant "multiply this base size" -- kept as a
+# reference constant so existing pixel_scale call-site values (tuned by
+# eye against the old fixed-size renderer) keep roughly the same visual
+# proportions relative to each other, now anchored to a fraction of the
+# window height instead of an absolute pixel count.
+REFERENCE_WINDOW_HEIGHT = 500  # the size stereometer.py's calls were tuned against
+BASE_FONT_PX_AT_REFERENCE = 14
 FONT_FACE = "Segoe UI"  # matches main.py's Tkinter launcher font
 
 gdi32 = ctypes.windll.gdi32
 user32 = ctypes.windll.user32
 
-# GDI constants
-DT_LEFT = 0x00000000
-DT_NOCLIP = 0x00000100
-DT_SINGLELINE = 0x00000020
 TRANSPARENT = 1
 DIB_RGB_COLORS = 0
 BI_RGB = 0
@@ -130,10 +126,8 @@ def render_text_to_alpha(text: str, font_px: int) -> np.ndarray:
     Renders `text` with GDI at the given pixel height and returns an
     (H, W) uint8 grayscale array (0..255) suitable for use as an alpha
     channel -- white text on black background, so pixel brightness
-    directly becomes glyph coverage. Unlike the old fixed 5x7 table,
-    this supports any character the chosen font face has a glyph for.
+    directly becomes glyph coverage.
     """
-    # 1) measure on a scratch DC to size the real one correctly
     screen_dc = user32.GetDC(0)
     measure_dc = gdi32.CreateCompatibleDC(screen_dc)
     font = gdi32.CreateFontW(
@@ -149,12 +143,10 @@ def render_text_to_alpha(text: str, font_px: int) -> np.ndarray:
     gdi32.SelectObject(measure_dc, old_font)
     gdi32.DeleteDC(measure_dc)
 
-    # 2) create a top-down 24bpp DIB section sized to fit the text and
-    # paint the string into it in white on black
     bmi = BITMAPINFO()
     bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
     bmi.bmiHeader.biWidth = w
-    bmi.bmiHeader.biHeight = -h  # negative = top-down (row 0 = top row)
+    bmi.bmiHeader.biHeight = -h  # negative = top-down
     bmi.bmiHeader.biPlanes = 1
     bmi.bmiHeader.biBitCount = 24
     bmi.bmiHeader.biCompression = BI_RGB
@@ -168,9 +160,7 @@ def render_text_to_alpha(text: str, font_px: int) -> np.ndarray:
     old_font = gdi32.SelectObject(dc, font)
 
     gdi32.SetBkMode(dc, TRANSPARENT)
-    gdi32.SetTextColor(dc, 0x00FFFFFF)  # white text; background stays black
-    # black background: DIBs from CreateDIBSection aren't guaranteed
-    # zeroed on all systems, so paint it explicitly before drawing text
+    gdi32.SetTextColor(dc, 0x00FFFFFF)
     black_brush = gdi32.GetStockObject(4)  # BLACK_BRUSH
     rect = wintypes.RECT(0, 0, w, h)
     user32.FillRect(dc, ctypes.byref(rect), black_brush)
@@ -178,15 +168,9 @@ def render_text_to_alpha(text: str, font_px: int) -> np.ndarray:
     gdi32.TextOutW(dc, 0, 0, text, len(text))
     gdi32.GdiFlush()
 
-    # row stride for 24bpp DIB rows is padded to a 4-byte boundary
     stride = ((w * 3 + 3) // 4) * 4
     buf = ctypes.cast(bits_ptr, ctypes.POINTER(ctypes.c_ubyte * (stride * h))).contents
     raw = np.frombuffer(buf, dtype=np.uint8).reshape(h, stride)[:, : w * 3].reshape(h, w, 3)
-
-    # BGR -> single-channel coverage. Text was painted pure white on
-    # pure black with AA at the edges, so any one channel already
-    # carries the coverage value; take max across channels to be safe
-    # against ClearType's per-subpixel color fringing.
     alpha = raw.max(axis=2).astype(np.uint8)
 
     gdi32.SelectObject(dc, old_bmp)
@@ -202,9 +186,12 @@ def render_text_to_alpha(text: str, font_px: int) -> np.ndarray:
 class TextRenderer:
     """
     Uploads one texture per unique (string, font_px) pair (cached) and
-    draws it as a textured quad at a given NDC position. Cache is small
-    (a handful of labels + readouts that change slowly relative to
-    frame rate).
+    draws it as a textured quad at a given NDC position. font_px is
+    resolved from the *current* window height every draw() call, so the
+    cache naturally grows one entry per (text, size-at-that-window-size)
+    combination -- sizes repeat whenever the window settles at a given
+    size (including back-and-forth during a drag-resize, since each
+    discrete pixel height it passes through reuses its own cache slot).
     """
 
     def __init__(self, program: int):
@@ -216,7 +203,7 @@ class TextRenderer:
         glBindVertexArray(self.vao)
         self.vbo = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-        glBufferData(GL_ARRAY_BUFFER, 6 * 4 * 4, None, GL_DYNAMIC_DRAW)  # 6 verts * (pos2+uv2) * 4 bytes
+        glBufferData(GL_ARRAY_BUFFER, 6 * 4 * 4, None, GL_DYNAMIC_DRAW)
         stride = 4 * 4
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
@@ -225,13 +212,24 @@ class TextRenderer:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        self._cache: dict[tuple[str, int], tuple[int, int, int]] = {}  # (text, font_px) -> (tex_id, w, h)
+        self._cache: dict[tuple[str, int], tuple[int, int, int]] = {}
+        # simple cap so a continuously-resizing window (many distinct
+        # font_px values) can't grow the texture cache without bound
+        self._max_cache_entries = 400
 
     def _get_texture(self, text: str, font_px: int):
         key = (text, font_px)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
+
+        if len(self._cache) >= self._max_cache_entries:
+            # drop an arbitrary entry (oldest-inserted in dict order) --
+            # this is a soft cap for pathological continuous-resize
+            # cases, not a hot path in normal use
+            oldest_key = next(iter(self._cache))
+            old_tex = self._cache.pop(oldest_key)[0]
+            glDeleteTextures([old_tex])
 
         bitmap = render_text_to_alpha(text, font_px)
         h, w = bitmap.shape
@@ -254,13 +252,17 @@ class TextRenderer:
               win_w: int, win_h: int, color=(0.75, 0.75, 0.8), align: str = "left"):
         """
         Draws `text` with its top-left (or centered, if align='center') at
-        (x_ndc, y_ndc). pixel_scale multiplies BASE_FONT_PX to get the
-        actual rendered font size in real pixels (e.g. pixel_scale=1.5
-        with BASE_FONT_PX=14 renders at 21px).
+        (x_ndc, y_ndc). font_px is resolved from win_h so the same
+        pixel_scale value always produces the same on-screen size
+        relative to the window, and the GDI bitmap is rendered near its
+        true final resolution regardless of window size -- this is what
+        keeps text sharp when the window is maximized/fullscreen instead
+        of stretching a small fixed-size texture.
         """
         if not text:
             return
-        font_px = max(1, round(BASE_FONT_PX * pixel_scale))
+        size_at_reference = BASE_FONT_PX_AT_REFERENCE * pixel_scale
+        font_px = max(1, round(size_at_reference * (win_h / REFERENCE_WINDOW_HEIGHT)))
         tex, w, h = self._get_texture(text, font_px)
 
         ndc_w = (w / win_w) * 2.0
