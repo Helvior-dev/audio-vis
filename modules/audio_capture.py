@@ -8,12 +8,28 @@ import AudioCapture and read the latest samples from it.
 Uses PyAudio's callback mode instead of blocking stream.read(). In
 blocking mode, read_chunk() calls stream.read() directly on the GUI
 thread -- if WASAPI stops delivering packets (e.g. the output device
-goes fully idle with nothing playing, which some drivers do instead of
-streaming silence), that call can block indefinitely and the whole
-window freezes ("Not Responding"). In callback mode, PortAudio runs
-audio I/O on its own thread and pushes chunks into a buffer; read_chunk()
-just drains that buffer and returns immediately (with zeros if nothing
-new has arrived yet), so the render loop never stalls waiting on audio.
+goes fully idle, which happens on pause), that call can block
+indefinitely and the whole window freezes ("Not Responding"). In
+callback mode, PortAudio runs audio I/O on its own thread and pushes
+chunks into a queue; read_chunk() drains that queue and returns
+immediately, so the render loop never stalls waiting on audio.
+
+read_chunk() drains and concatenates *every* chunk currently queued,
+not just one. The audio callback fires roughly every chunk_size/rate
+seconds (a few ms), which is faster than most render loops poll --
+taking only one queued chunk per read_chunk() call means the queue
+keeps growing behind the reader, and every module ends up visualizing
+audio that's increasingly behind what's actually playing (the backlog
+was audible as a growing lag, worse the longer playback ran). Draining
+the whole queue each call keeps the reader caught up to the writer, so
+there's no accumulating delay -- callers already handle variable-length
+chunks (they index by len(chunk), not a fixed chunk_size).
+
+When nothing is queued (e.g. playback is paused and WASAPI isn't
+delivering new packets), read_chunk() returns actual silence instead of
+replaying the last real chunk -- repeating old audio would freeze the
+visualization on a stale frame instead of honestly showing "nothing is
+playing right now".
 
 Standalone test: run this file directly, it prints RMS level to
 console every ~50ms so you can verify audio is being captured
@@ -21,7 +37,6 @@ before wiring up any visuals.
 """
 
 import queue
-import threading
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -36,9 +51,11 @@ class AudioCapture:
         self.rate = 44100
 
         # bounded queue of raw chunks from the callback thread; bounded
-        # so a stalled consumer can't leak memory if it ever falls behind
+        # so a stalled consumer can't leak memory, though normal use
+        # drains it every read_chunk() call so it rarely holds more
+        # than one or two chunks at a time
         self._queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=64)
-        self._last_chunk = None  # returned when the queue is empty (silence/underrun)
+        self._silence = None  # a single silent chunk, returned on underrun
 
         self._open_loopback_stream()
 
@@ -68,7 +85,7 @@ class AudioCapture:
 
         self.channels = int(default_speakers["maxInputChannels"])
         self.rate = int(default_speakers["defaultSampleRate"])
-        self._last_chunk = np.zeros((self.chunk_size, self.channels), dtype=np.float32)
+        self._silence = np.zeros((self.chunk_size, self.channels), dtype=np.float32)
 
         self.stream = self.pa.open(
             format=pyaudio.paFloat32,
@@ -102,22 +119,31 @@ class AudioCapture:
 
     def read_chunk(self) -> np.ndarray:
         """
-        Returns shape (chunk_size, channels) float32 array, range [-1, 1].
+        Returns shape (N, channels) float32 array, range [-1, 1]. N is
+        normally close to chunk_size but not guaranteed to be exactly
+        chunk_size -- it's every sample that arrived since the last call,
+        concatenated, so callers (which already index by len(chunk))
+        stay in sync with real time instead of falling behind a growing
+        queue.
 
-        Non-blocking: if no new chunk has arrived since the last call
-        (e.g. the output device is fully idle and WASAPI isn't
-        delivering packets), returns the last chunk received instead of
-        blocking the caller -- callers already treat near-silent input
-        the same as silence, so repeating the last real chunk for a
-        frame or two is visually indistinguishable from underrun and,
-        critically, never freezes the render loop.
+        Non-blocking: if nothing has arrived since the last call (e.g.
+        playback is paused and WASAPI isn't delivering packets), returns
+        a chunk of silence rather than either blocking or replaying old
+        audio -- so the visualization honestly goes quiet instead of
+        freezing on the last frame that had real signal.
         """
+        chunks = []
         try:
-            chunk = self._queue.get_nowait()
-            self._last_chunk = chunk
-            return chunk
+            while True:
+                chunks.append(self._queue.get_nowait())
         except queue.Empty:
-            return self._last_chunk
+            pass
+
+        if not chunks:
+            return self._silence
+        if len(chunks) == 1:
+            return chunks[0]
+        return np.concatenate(chunks, axis=0)
 
     def close(self):
         if self.stream is not None:
@@ -132,11 +158,11 @@ if __name__ == "__main__":
     print("Opening loopback stream... play some audio now.")
     cap = AudioCapture(chunk_size=256)
     print(f"Capturing: {cap.channels} channels @ {cap.rate} Hz, chunk_size=256")
-    print("Measuring real read_chunk() timing for 5 seconds...")
-    print("(expected ~5.3ms per call at 48000Hz if not blocking excessively)")
+    print("Measuring real read_chunk() timing and returned chunk sizes for 5 seconds...")
     print()
 
     times = []
+    sizes = []
     start = time.time()
     try:
         while time.time() - start < 5.0:
@@ -144,7 +170,8 @@ if __name__ == "__main__":
             chunk = cap.read_chunk()
             t1 = time.perf_counter()
             times.append(t1 - t0)
-            time.sleep(0.005)  # callback mode doesn't pace read_chunk() itself anymore
+            sizes.append(len(chunk))
+            time.sleep(0.005)
     except KeyboardInterrupt:
         pass
     finally:
@@ -152,6 +179,5 @@ if __name__ == "__main__":
 
     times_ms = [t * 1000 for t in times]
     print(f"Total calls in 5s: {len(times_ms)}")
-    print(f"Min: {min(times_ms):.3f}ms  Max: {max(times_ms):.3f}ms  Avg: {sum(times_ms)/len(times_ms):.3f}ms")
-    print(f"Calls over 20ms: {sum(1 for t in times_ms if t > 20)}")
-    print(f"Calls over 100ms: {sum(1 for t in times_ms if t > 100)}")
+    print(f"Call time -- Min: {min(times_ms):.3f}ms  Max: {max(times_ms):.3f}ms  Avg: {sum(times_ms)/len(times_ms):.3f}ms")
+    print(f"Chunk size -- Min: {min(sizes)}  Max: {max(sizes)}  Avg: {sum(sizes)/len(sizes):.1f}")

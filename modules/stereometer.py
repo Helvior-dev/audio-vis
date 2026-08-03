@@ -330,17 +330,38 @@ class VectorscopeWindow:
         glDrawArrays(GL_TRIANGLES, 0, 6)
 
     def _draw_circle_window(self, cx, cy, r, color, alpha=1.0, segments=24):
-        """Window-NDC counterpart of _draw_circle, see _draw_quad_window."""
-        glUniform2f(self.offset_loc, cx, cy)
-        glUniform1f(self.scale_loc, r)
-        glUniform2f(self.aspect_loc, 1.0, 1.0)
-        glUniform3f(self.color_loc, *color)
-        glUniform1f(self.alpha_loc, alpha)
-        angles = np.linspace(0, 2 * np.pi, segments, endpoint=True, dtype=np.float32)
-        verts = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
-        glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
-        glDrawArrays(GL_LINE_STRIP, 0, segments)
+            """
+            Window-NDC positioned circle that stays a true circle regardless
+            of window aspect ratio. _draw_circle_window previously used
+            aspect_scale=(1,1) to keep the *position* in real window NDC,
+            but that also left the *shape* uncorrected -- on a non-square
+            window, NDC units are physically different sizes on x vs y, so
+            an uncorrected circle (equal radius in raw NDC) renders as an
+            ellipse, same root cause as the diamond-turning-into-an-ellipse
+            bug this whole aspect_scale mechanism was built to fix.
+
+            The shader applies aspect_scale to both offset and the vertex
+            shape (p = pos*scale*aspect_scale + offset*aspect_scale), so
+            using the real aspect_scale here would correctly round out the
+            shape but also pull the icon's position toward the window
+            center on a wide monitor -- reintroducing the very "icon drifts
+            out of the corner" bug from the previous pass. Pre-dividing cx/cy
+            by aspect_scale here cancels that: after the shader multiplies by
+            aspect_scale again, offset lands back at exactly (cx, cy) in
+            window NDC, while the vertex shape still gets the correction it
+            needs to stay circular.
+            """
+            ax, ay = self._aspect_scale()
+            glUniform2f(self.offset_loc, cx / ax, cy / ay)
+            glUniform1f(self.scale_loc, r)
+            glUniform2f(self.aspect_loc, ax, ay)
+            glUniform3f(self.color_loc, *color)
+            glUniform1f(self.alpha_loc, alpha)
+            angles = np.linspace(0, 2 * np.pi, segments, endpoint=True, dtype=np.float32)
+            verts = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
+            glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+            glDrawArrays(GL_LINE_STRIP, 0, segments)
 
     def _text_window(self, s, x_ndc, y_ndc, scale, color, align="left"):
         """
@@ -380,26 +401,32 @@ class VectorscopeWindow:
         glDrawArrays(GL_LINE_STRIP, 0, segments)
 
     def _text_square(self, s, x_ndc, y_ndc, scale, color, align="left"):
-        """
-        Draws text positioned in the aspect-corrected square NDC space
-        the diamond diagram uses. Needed because TextRenderer.draw()
-        sizes glyphs from win_w/win_h directly (real pixels), so on a
-        non-square window we pass the square's actual on-screen pixel
-        extent (min(width,height)) for sizing, but keep window width/
-        height for converting that pixel size back into NDC.
-        """
-        ax, ay = self._aspect_scale()
-        min_dim = min(self.width, self.height)
-        # position: square NDC -> window NDC
-        x_win = x_ndc * ax
-        y_win = y_ndc * ay
-        # size glyphs relative to the square's pixel size, then express
-        # that as window NDC by using min_dim as both win_w/win_h --
-        # TextRenderer.draw()'s ndc_w/ndc_h math is (pixels/win_dim)*2,
-        # so passing min_dim for both keeps glyph pixel size constant
-        # regardless of window aspect, matching the square content.
-        self.text.draw(s, x_win, y_win, pixel_scale=scale,
-                        win_w=min_dim, win_h=min_dim, color=color, align=align)
+            """
+            Draws text positioned in the aspect-corrected square NDC space
+            the diamond diagram uses, but SIZED in real window NDC.
+
+            Earlier versions passed win_w=win_h=min(width,height) to size
+            the glyph quad, reasoning that "square" units would keep glyph
+            proportions correct. That was wrong: TEXT_VERTEX_SHADER writes
+            gl_Position directly with no aspect correction of its own, so
+            whatever ndc_w/ndc_h TextRenderer.draw() computes gets mapped
+            straight onto the real (possibly non-square) framebuffer. Sizing
+            against min_dim/min_dim produced a glyph quad whose width and
+            height were equal fractions of a *hypothetical* square window --
+            but stretched onto the *actual* non-square framebuffer, that
+            equal-fraction quad renders at different physical width/height
+            ratios than the source bitmap, which is exactly the horizontal
+            stretching seen on wide monitors. Passing the real width/height
+            here sizes the quad correctly for the framebuffer it's actually
+            drawn on; only the *position* (x_win/y_win below) needs the
+            square-space correction, so the text's anchor point still lines
+            up with the aspect-corrected diamond geometry.
+            """
+            ax, ay = self._aspect_scale()
+            x_win = x_ndc * ax
+            y_win = y_ndc * ay
+            self.text.draw(s, x_win, y_win, pixel_scale=scale,
+                            win_w=self.width, win_h=self.height, color=color, align=align)
 
     def _draw_help_icon(self):
         hovering = False
@@ -435,6 +462,15 @@ class VectorscopeWindow:
                 self._text_window(line, -0.88, start_y - i * line_h, scale, color, align="left")
 
     def render_frame(self):
+        if self.width <= 0 or self.height <= 0:
+            # window is minimized -- GLFW reports a 0x0 framebuffer in
+            # this state. Nothing is visible anyway, and every NDC/pixel
+            # calculation in this file (and in TextRenderer.draw(),
+            # which divides by win_w/win_h) assumes a positive size, so
+            # skip the frame entirely rather than let one of those
+            # divisions raise ZeroDivisionError and crash the process.
+            return
+
         glClearColor(0.03, 0.03, 0.04, 1.0)
         glClear(GL_COLOR_BUFFER_BIT)
         glUseProgram(self.program)

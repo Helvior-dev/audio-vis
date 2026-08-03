@@ -259,7 +259,12 @@ class TextRenderer:
         keeps text sharp when the window is maximized/fullscreen instead
         of stretching a small fixed-size texture.
         """
-        if not text:
+        if not text or win_w <= 0 or win_h <= 0:
+            # win_w/win_h are 0 when the window is minimized (GLFW
+            # reports a 0x0 framebuffer in that state) -- skip rather
+            # than divide by zero below. Callers should generally skip
+            # the whole frame in that case (nothing is visible anyway),
+            # but this guard protects any caller that doesn't.
             return
         size_at_reference = BASE_FONT_PX_AT_REFERENCE * pixel_scale
         font_px = max(1, round(size_at_reference * (win_h / REFERENCE_WINDOW_HEIGHT)))
