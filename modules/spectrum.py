@@ -100,6 +100,11 @@ class SpectrumWindow:
         if not self.window:
             glfw.terminate()
             raise RuntimeError("GLFW window creation failed")
+        
+        monitor = glfw.get_primary_monitor()
+        mode = glfw.get_video_mode(monitor)
+        glfw.set_window_pos(self.window, (mode.size.width - self.width) // 2, (mode.size.height - self.height) // 2)
+
 
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
@@ -134,6 +139,8 @@ class SpectrumWindow:
 
     def _update_audio(self):
         chunk = self.audio.read_chunk()  # (read_chunk_size, channels)
+        if chunk is None:
+            return
         mono = chunk.mean(axis=1).astype(np.float32)
         n = len(mono)
 

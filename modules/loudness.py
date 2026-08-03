@@ -405,6 +405,11 @@ class LoudnessWindow:
         if not self.window:
             glfw.terminate()
             raise RuntimeError("GLFW window creation failed")
+        
+        monitor = glfw.get_primary_monitor()
+        mode = glfw.get_video_mode(monitor)
+        glfw.set_window_pos(self.window, (mode.size.width - self.width) // 2, (mode.size.height - self.height) // 2)
+
 
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
@@ -465,6 +470,8 @@ class LoudnessWindow:
         self.last_time = now
 
         chunk = self.audio.read_chunk()  # (N, channels)
+        if chunk is None:
+            return
         left = chunk[:, 0]
         right = chunk[:, 1]
 

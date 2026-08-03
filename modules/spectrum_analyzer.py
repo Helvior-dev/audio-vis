@@ -183,6 +183,11 @@ class SpectrumAnalyzerWindow:
         if not self.window:
             glfw.terminate()
             raise RuntimeError("GLFW window creation failed")
+        
+        monitor = glfw.get_primary_monitor()
+        mode = glfw.get_video_mode(monitor)
+        glfw.set_window_pos(self.window, (mode.size.width - self.width) // 2, (mode.size.height - self.height) // 2)
+
 
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
@@ -261,8 +266,27 @@ class SpectrumAnalyzerWindow:
 
     def _update_audio(self):
         chunk = self.audio.read_chunk()
+        if chunk is None:
+            return
         mono = chunk.mean(axis=1).astype(np.float32)
         n = len(mono)
+
+        # A window resize/drag stalls the render loop for a bit (GLFW
+        # blocks pumping frames during the native resize drag on
+        # Windows), so several audio callbacks' worth of chunks pile up
+        # in AudioCapture's queue. The next read_chunk() call then
+        # returns all of them concatenated -- n can come back larger
+        # than FFT_SIZE. rolling_buffer is a fixed-size ring of the last
+        # FFT_SIZE samples, so only the most recent FFT_SIZE samples of
+        # mono are relevant to it; anything older is already outside the
+        # analysis window and would overflow the buffer[-n:] assignment
+        # below if kept. Trimming here (rather than only when n >=
+        # FFT_SIZE) is the same operation either way -- np.roll with
+        # n == 0 after trimming would be a no-op, so no separate branch
+        # is needed for the "huge n" case vs. the normal case.
+        if n > FFT_SIZE:
+            mono = mono[-FFT_SIZE:]
+            n = FFT_SIZE
 
         self.rolling_buffer = np.roll(self.rolling_buffer, -n)
         self.rolling_buffer[-n:] = mono

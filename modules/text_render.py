@@ -249,54 +249,67 @@ class TextRenderer:
         return result
 
     def draw(self, text: str, x_ndc: float, y_ndc: float, pixel_scale: float,
-              win_w: int, win_h: int, color=(0.75, 0.75, 0.8), align: str = "left"):
-        """
-        Draws `text` with its top-left (or centered, if align='center') at
-        (x_ndc, y_ndc). font_px is resolved from win_h so the same
-        pixel_scale value always produces the same on-screen size
-        relative to the window, and the GDI bitmap is rendered near its
-        true final resolution regardless of window size -- this is what
-        keeps text sharp when the window is maximized/fullscreen instead
-        of stretching a small fixed-size texture.
-        """
-        if not text or win_w <= 0 or win_h <= 0:
-            # win_w/win_h are 0 when the window is minimized (GLFW
-            # reports a 0x0 framebuffer in that state) -- skip rather
-            # than divide by zero below. Callers should generally skip
-            # the whole frame in that case (nothing is visible anyway),
-            # but this guard protects any caller that doesn't.
-            return
-        size_at_reference = BASE_FONT_PX_AT_REFERENCE * pixel_scale
-        font_px = max(1, round(size_at_reference * (win_h / REFERENCE_WINDOW_HEIGHT)))
-        tex, w, h = self._get_texture(text, font_px)
+                  win_w: int, win_h: int, color=(0.75, 0.75, 0.8), align: str = "left",
+                  valign: str = "top"):
+            """
+            Draws `text` at (x_ndc, y_ndc). font_px is resolved from win_h so
+            the same pixel_scale value always produces the same on-screen
+            size relative to the window, and the GDI bitmap is rendered near
+            its true final resolution regardless of window size -- this is
+            what keeps text sharp when the window is maximized/fullscreen
+            instead of stretching a small fixed-size texture.
 
-        ndc_w = (w / win_w) * 2.0
-        ndc_h = (h / win_h) * 2.0
+            align: 'left' (default) anchors x_ndc to the text's left edge;
+            'center' anchors x_ndc to its horizontal center.
+            valign: 'top' (default, and the only behavior before this
+            parameter existed) anchors y_ndc to the text's top edge, so the
+            text extends downward from y_ndc; 'middle' anchors y_ndc to the
+            text's vertical center -- e.g. for a glyph like "?" centered
+            inside a circle, where the caller has one point (the circle's
+            center) and no natural "top" to anchor against.
+            """
+            if not text or win_w <= 0 or win_h <= 0:
+                # win_w/win_h are 0 when the window is minimized (GLFW
+                # reports a 0x0 framebuffer in that state) -- skip rather
+                # than divide by zero below. Callers should generally skip
+                # the whole frame in that case (nothing is visible anyway),
+                # but this guard protects any caller that doesn't.
+                return
+            size_at_reference = BASE_FONT_PX_AT_REFERENCE * pixel_scale
+            font_px = max(1, round(size_at_reference * (win_h / REFERENCE_WINDOW_HEIGHT)))
+            tex, w, h = self._get_texture(text, font_px)
 
-        x0 = x_ndc - ndc_w / 2.0 if align == "center" else x_ndc
-        x1 = x0 + ndc_w
-        y1 = y_ndc
-        y0 = y_ndc - ndc_h
+            ndc_w = (w / win_w) * 2.0
+            ndc_h = (h / win_h) * 2.0
 
-        verts = np.array([
-            x0, y0, 0.0, 1.0,
-            x1, y0, 1.0, 1.0,
-            x1, y1, 1.0, 0.0,
-            x0, y0, 0.0, 1.0,
-            x1, y1, 1.0, 0.0,
-            x0, y1, 0.0, 0.0,
-        ], dtype=np.float32)
+            x0 = x_ndc - ndc_w / 2.0 if align == "center" else x_ndc
+            x1 = x0 + ndc_w
+            if valign == "middle":
+                y1 = y_ndc + ndc_h / 2.0
+                y0 = y_ndc - ndc_h / 2.0
+            else:
+                y1 = y_ndc
+                y0 = y_ndc - ndc_h
 
-        glUseProgram(self.program)
-        glUniform3f(self.color_loc, *color)
-        glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D, tex)
-        glUniform1i(self.tex_loc, 0)
+            verts = np.array([
+                x0, y0, 0.0, 1.0,
+                x1, y0, 1.0, 1.0,
+                x1, y1, 1.0, 0.0,
+                x0, y0, 0.0, 1.0,
+                x1, y1, 1.0, 0.0,
+                x0, y1, 0.0, 0.0,
+            ], dtype=np.float32)
 
-        glBindVertexArray(self.vao)
-        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
-        glDrawArrays(GL_TRIANGLES, 0, 6)
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-        glBindVertexArray(0)
-        glBindTexture(GL_TEXTURE_2D, 0)
+            glUseProgram(self.program)
+            glUniform3f(self.color_loc, *color)
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, tex)
+            glUniform1i(self.tex_loc, 0)
+
+            glBindVertexArray(self.vao)
+            glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+            glDrawArrays(GL_TRIANGLES, 0, 6)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            glBindVertexArray(0)
+            glBindTexture(GL_TEXTURE_2D, 0)
