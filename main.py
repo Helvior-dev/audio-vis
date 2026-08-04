@@ -8,16 +8,103 @@ Styled to match the dark, card-based look of the visualizer windows
 themselves, instead of stock Tk widgets.
 """
 
+import base64
 import subprocess
 import sys
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 
-from modules.window_utils import apply_dark_titlebar_tk
+from modules.window_utils import apply_dark_titlebar_tk, set_window_icon_tk
 from modules.audio_capture import AudioSource, list_audio_sources
 from modules.audio_source_config import save_selected_source, load_selected_source
 
 MODULES_DIR = Path(__file__).parent / "modules"
+ICON_PATH = MODULES_DIR / "assets" / "icon.png"
+
+REPO_URL = "https://github.com/Helvior-dev/audio-vis"
+
+# GitHub octocat mark, embedded as base64 PNG (Octicons "mark-github",
+# 16x16 viewBox, MIT-licensed -- https://primer.style/foundations/icons),
+# rendered at 64x64 for a crisp small icon. Two pre-rendered color states
+# (idle/hover) instead of colorizing at runtime, since tk.PhotoImage has
+# no built-in tint operation.
+GITHUB_ICON_IDLE_B64 = (
+    "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"
+)
+
+GITHUB_ICON_HOVER_B64 = (
+    "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"
+    "SUVORK5CYII="
+)
+
 
 # display name -> (script filename, icon key)
 MODULES = [
@@ -129,6 +216,86 @@ class ModuleButton(tk.Canvas):
     def set_running(self, running: bool):
         self.running = running
         self._draw()
+
+    def _on_enter(self, _event):
+        self._hover = True
+        self._draw()
+
+    def _on_leave(self, _event):
+        self._hover = False
+        self._draw()
+
+
+class GitHubFooter(tk.Canvas):
+    """
+    Small clickable row at the bottom of the launcher: GitHub octocat
+    icon + "by Helvior" text. Opens REPO_URL in the system's default
+    browser on click -- webbrowser.open() shells out to the OS handler
+    (start/open/xdg-open under the hood), so there's no extra dependency
+    and no need to know which browser the user has.
+
+    The icon itself is the real Octicons "mark-github" glyph, pre-
+    rendered to two small PNGs (idle/hover color) and embedded as
+    base64 (GITHUB_ICON_IDLE_B64 / GITHUB_ICON_HOVER_B64) -- drawing a
+    recognizable octocat out of tk.Canvas primitives (ovals/polygons)
+    at this size doesn't hold up, it reads as an unrecognizable blob
+    rather than the GitHub mark, so this uses the actual icon instead.
+    """
+
+    WIDTH, HEIGHT = 320, 28
+    HOVER_COLOR = "#e9e9ee"
+    ICON_SIZE = 18  # on-screen size in px; source PNGs are 64x64, downscaled here
+
+    def __init__(self, parent, url: str, label: str = "by Helvior"):
+        super().__init__(
+            parent, width=self.WIDTH, height=self.HEIGHT,
+            bg=BG, highlightthickness=0, bd=0, cursor="hand2",
+        )
+        self.url = url
+        self.label = label
+        self._hover = False
+
+        # tk.PhotoImage needs its source bytes kept alive for as long as
+        # the image is in use -- storing on self (not a local var) so
+        # they aren't garbage-collected after __init__ returns, which
+        # would blank the icon
+        self._icon_idle = self._load_icon(GITHUB_ICON_IDLE_B64)
+        self._icon_hover = self._load_icon(GITHUB_ICON_HOVER_B64)
+
+        self._draw()
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", lambda _e: webbrowser.open(self.url))
+
+    def _load_icon(self, b64_data: str) -> tk.PhotoImage | None:
+        raw = base64.b64decode(b64_data)
+        try:
+            img = tk.PhotoImage(data=raw)
+        except tk.TclError:
+            # Tk < 8.6 has no built-in PNG decoder in PhotoImage -- fall
+            # back to no icon (a plain dot is drawn instead, see _draw())
+            # rather than crashing the whole launcher over a footer icon
+            return None
+        # source PNG is rendered at 64x64 for crispness; subsample down
+        # to the actual on-screen size instead of drawing it oversized
+        factor = max(1, img.width() // self.ICON_SIZE)
+        if factor > 1:
+            img = img.subsample(factor, factor)
+        return img
+
+    def _draw(self):
+        self.delete("all")
+        color = self.HOVER_COLOR if self._hover else TEXT_MUTED
+        icon = self._icon_hover if self._hover else self._icon_idle
+        cy = self.HEIGHT / 2
+        if icon is not None:
+            self.create_image(14, cy, image=icon, anchor="center")
+        else:
+            self.create_oval(8, cy - 6, 20, cy + 6, fill=color, outline="")
+        self.create_text(
+            30, cy, text=self.label, anchor="w",
+            fill=color, font=("Segoe UI", 9),
+        )
 
     def _on_enter(self, _event):
         self._hover = True
@@ -276,6 +443,10 @@ class Launcher:
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
         apply_dark_titlebar_tk(self.root)
+        # keep the PhotoImage alive on self -- Tk only holds a weak
+        # reference internally, so a purely local variable here would
+        # get garbage-collected and the icon would vanish later
+        self.icon_img = set_window_icon_tk(self.root, ICON_PATH)
 
         header = tk.Frame(root, bg=BG)
         header.pack(fill="x", padx=26, pady=(24, 6))
@@ -308,6 +479,12 @@ class Launcher:
             btn = ModuleButton(body, name, icon, on_click=lambda n=name: self.toggle(n))
             btn.pack(pady=4)
             self.buttons[name] = btn
+
+        footer_divider = tk.Frame(root, bg=CARD_BORDER, height=1)
+        footer_divider.pack(fill="x", padx=26, pady=(0, 8))
+
+        footer = GitHubFooter(root, REPO_URL)
+        footer.pack(anchor="w", padx=26, pady=(0, 16))
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         # poll every 500ms to catch modules the user closed manually (window X button)

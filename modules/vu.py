@@ -25,10 +25,9 @@ import glfw
 import numpy as np
 from OpenGL.GL import *
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
-from audio_source_config import load_selected_source, SourceWatcher
 
 DB_MIN = -20.0
 DB_MAX = 3.0
@@ -196,6 +195,14 @@ class VUWindow:
         glfw.window_hint(glfw.RESIZABLE, glfw.TRUE)
 
         self.width, self.height = 800, 140
+        # start hidden: create_window() shows the HWND immediately, but
+        # nothing is drawn into it until the first swap_buffers() call
+        # in run() -- without this hint that gap (shader compiles,
+        # AudioCapture opening the WASAPI stream, icon decoding, etc.)
+        # is visible as a blank white window. run() shows the window
+        # itself right after the first real frame is drawn, so the
+        # window only ever appears with content already in it.
+        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
         self.window = glfw.create_window(self.width, self.height, "VU Meter", None, None)
         if not self.window:
             glfw.terminate()
@@ -243,8 +250,7 @@ class VUWindow:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        self.audio = AudioCapture(chunk_size=512, source=load_selected_source())
-        self.source_watcher = SourceWatcher()
+        self.audio = AudioCapture(chunk_size=512)
         self.current_db = DB_MIN       # raw measured level this frame
         self.displayed_db = DB_MIN     # eased value actually drawn
         self.peak_db = DB_MIN
@@ -255,12 +261,6 @@ class VUWindow:
         glViewport(0, 0, width, height)
 
     def _update_audio(self):
-        # cheap mtime check every frame; only re-reads/reopens when the
-        # launcher (or another window) actually changed the selection
-        new_source = self.source_watcher.check()
-        if new_source is not None:
-            self.audio.reopen(new_source)
-
         chunk = self.audio.read_chunk()
         if chunk is None:
             return
@@ -382,6 +382,14 @@ class VUWindow:
 
     def run(self):
         try:
+            # draw + present one real frame before revealing the
+            # window (see the VISIBLE hint above) so nothing white
+            # or half-initialized is ever shown
+            self._update_audio()
+            self.render_frame()
+            glfw.swap_buffers(self.window)
+            glfw.show_window(self.window)
+
             while not glfw.window_should_close(self.window):
                 self._update_audio()
                 self.render_frame()

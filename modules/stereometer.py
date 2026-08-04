@@ -33,9 +33,11 @@ from OpenGL.GL import *
 
 sys.path.insert(0, str(Path(__file__).parent))
 from audio_capture import AudioCapture
-from window_utils import apply_dark_titlebar, remove_titlebar_icon
+from window_utils import apply_dark_titlebar, set_window_icon
 from text_render import TextRenderer, TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, link_program as text_link_program
 from audio_source_config import load_selected_source, SourceWatcher
+
+ICON_PATH = Path(__file__).parent / "assets" / "icon.png"
 
 HISTORY_POINTS = 1024  # how many recent samples are plotted as dots
 
@@ -127,6 +129,14 @@ class VectorscopeWindow:
         glfw.window_hint(glfw.RESIZABLE, glfw.TRUE)
 
         self.width, self.height = 500, 500
+        # start hidden: create_window() shows the HWND immediately, but
+        # nothing is drawn into it until the first swap_buffers() call
+        # in run() -- without this hint that gap (shader compiles,
+        # AudioCapture opening the WASAPI stream, icon decoding, etc.)
+        # is visible as a blank white window. run() shows the window
+        # itself right after the first real frame is drawn, so the
+        # window only ever appears with content already in it.
+        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
         self.window = glfw.create_window(self.width, self.height, "Stereometer", None, None)
         if not self.window:
             glfw.terminate()
@@ -144,7 +154,7 @@ class VectorscopeWindow:
         glfw.set_cursor_pos_callback(self.window, self._on_cursor_move)
         glfw.set_window_aspect_ratio(self.window, 1, 1)
         apply_dark_titlebar(self.window)
-        remove_titlebar_icon(self.window)
+        set_window_icon(self.window, ICON_PATH)
 
         self.program = link_program(VERTEX_SHADER, FRAGMENT_SHADER)
         self.color_loc = glGetUniformLocation(self.program, "color")
@@ -488,6 +498,14 @@ class VectorscopeWindow:
 
     def run(self):
         try:
+            # draw + present one real frame before revealing the
+            # window (see the VISIBLE hint above) so nothing white
+            # or half-initialized is ever shown
+            self._update_audio()
+            self.render_frame()
+            glfw.swap_buffers(self.window)
+            glfw.show_window(self.window)
+
             while not glfw.window_should_close(self.window):
                 self._update_audio()
                 self.render_frame()

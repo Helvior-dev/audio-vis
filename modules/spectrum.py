@@ -21,9 +21,11 @@ from OpenGL.GL import *
 
 sys.path.insert(0, str(Path(__file__).parent))
 from audio_capture import AudioCapture
-from window_utils import apply_dark_titlebar
+from window_utils import apply_dark_titlebar, set_window_icon
 from text_render import TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, TextRenderer
 from audio_source_config import load_selected_source, SourceWatcher
+
+ICON_PATH = Path(__file__).parent / "assets" / "icon.png"
 
 FFT_SIZE = 2048
 NUM_BARS = 64
@@ -131,6 +133,14 @@ class SpectrumWindow:
         glfw.window_hint(glfw.RESIZABLE, glfw.TRUE)
 
         self.width, self.height = 800, 300
+        # start hidden: create_window() shows the HWND immediately, but
+        # nothing is drawn into it until the first swap_buffers() call
+        # in run() -- without this hint that gap (shader compiles,
+        # AudioCapture opening the WASAPI stream, icon decoding, etc.)
+        # is visible as a blank white window. run() shows the window
+        # itself right after the first real frame is drawn, so the
+        # window only ever appears with content already in it.
+        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
         self.window = glfw.create_window(self.width, self.height, "Spectrum", None, None)
         if not self.window:
             glfw.terminate()
@@ -146,6 +156,7 @@ class SpectrumWindow:
         glfw.set_cursor_pos_callback(self.window, self._on_cursor_move)
         glfw.set_mouse_button_callback(self.window, self._on_mouse_button)
         apply_dark_titlebar(self.window)
+        set_window_icon(self.window, ICON_PATH)
 
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -368,6 +379,14 @@ class SpectrumWindow:
 
     def run(self):
         try:
+            # draw + present one real frame before revealing the
+            # window (see the VISIBLE hint above) so nothing white
+            # or half-initialized is ever shown
+            self._update_audio()
+            self.render_frame()
+            glfw.swap_buffers(self.window)
+            glfw.show_window(self.window)
+
             while not glfw.window_should_close(self.window):
                 self._update_audio()
                 self.render_frame()
