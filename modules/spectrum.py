@@ -397,6 +397,10 @@ class SpectrumWindow:
             glfw.terminate()
 
 
-if __name__ == "__main__":
+def main():
     app = SpectrumWindow()
     app.run()
+
+
+if __name__ == "__main__":
+    main()

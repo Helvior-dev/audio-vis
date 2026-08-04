@@ -15,12 +15,30 @@ import tkinter as tk
 import webbrowser
 from pathlib import Path
 
+# Two different "base" directories matter once this is frozen into a
+# PyInstaller exe:
+#  - bundled read-only data (icons, packaged .py "modules" if any) lives
+#    under sys._MEIPASS, the temp folder PyInstaller extracts into.
+#  - anything we want to persist across runs (audio_source.json) must
+#    live next to the actual .exe instead, since _MEIPASS is wiped on exit.
+# When running from source (not frozen), both are just this file's folder.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+else:
+    BASE_DIR = Path(__file__).parent
+
+MODULES_DIR = BASE_DIR / "modules"
+ICON_PATH = MODULES_DIR / "assets" / "icon.png"
+
+# The visualizer modules use flat imports between themselves
+# (e.g. "from audio_capture import AudioCapture"), so modules/ must be
+# on sys.path both for the launcher's own "modules.xxx" imports below
+# and for the visualizer modules when we call their main() in-process.
+sys.path.insert(0, str(MODULES_DIR))
+
 from modules.window_utils import apply_dark_titlebar_tk, set_window_icon_tk
 from modules.audio_capture import AudioSource, list_audio_sources
 from modules.audio_source_config import save_selected_source, load_selected_source
-
-MODULES_DIR = Path(__file__).parent / "modules"
-ICON_PATH = MODULES_DIR / "assets" / "icon.png"
 
 REPO_URL = "https://github.com/Helvior-dev/audio-vis"
 
@@ -499,8 +517,18 @@ class Launcher:
             self.buttons[name].set_running(False)
         else:
             # not running -> start it
-            script = MODULES_DIR / self._scripts[name]
-            new_proc = subprocess.Popen([sys.executable, str(script)])
+            # Re-invoke ourselves with a flag that tells the new process to
+            # run just this one visualizer module instead of showing the
+            # launcher window again. When frozen (PyInstaller exe),
+            # sys.executable IS our own exe. When running from source,
+            # sys.executable is python.exe, so we also need to pass our
+            # own script path as the first argument.
+            module_stem = Path(self._scripts[name]).stem  # "loudness.py" -> "loudness"
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--module", module_stem]
+            else:
+                cmd = [sys.executable, __file__, "--module", module_stem]
+            new_proc = subprocess.Popen(cmd)
             self.processes[name] = new_proc
             self.buttons[name].set_running(True)
 
@@ -519,7 +547,25 @@ class Launcher:
         self.root.destroy()
 
 
+def run_module(module_stem: str):
+    """
+    Run a single visualizer module in-process, as if it were launched as
+    __main__ directly. module_stem is e.g. "loudness" (no .py, no path).
+    Used both when frozen into one exe and when running from source, so
+    "one exe" and "python main.py" behave the same way.
+    """
+    import importlib
+    mod = importlib.import_module(module_stem)
+    # Each visualizer script defines its own main() function; we call it
+    # explicitly here instead of relying on the "if __name__ == '__main__':"
+    # block, which only runs when the module is executed directly.
+    mod.main()
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = Launcher(root)
-    root.mainloop()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--module":
+        run_module(sys.argv[2])
+    else:
+        root = tk.Tk()
+        app = Launcher(root)
+        root.mainloop()

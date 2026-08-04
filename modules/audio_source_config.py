@@ -23,6 +23,7 @@ the old or the new complete value, never a torn one.
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -41,7 +42,18 @@ except ImportError:
     # against, so fall back to the bare/absolute form
     from audio_capture import AudioSource
 
-CONFIG_PATH = Path(__file__).parent / "audio_source.json"
+# Must live next to the executable (or next to this source file, when
+# running unfrozen), NOT under Path(__file__).parent as-is: when frozen
+# by PyInstaller, __file__ resolves inside the temp _MEIxxxx extraction
+# folder, which is private to each process and wiped after exit. Every
+# visualizer runs as its own subprocess and they all need to agree on
+# one shared, persistent file to read/write the selected audio source.
+if getattr(sys, "frozen", False):
+    _CONFIG_DIR = Path(sys.executable).parent
+else:
+    _CONFIG_DIR = Path(__file__).parent
+
+CONFIG_PATH = _CONFIG_DIR / "audio_source.json"
 
 
 def save_selected_source(source: AudioSource) -> None:

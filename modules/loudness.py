@@ -813,6 +813,10 @@ class LoudnessWindow:
             glfw.terminate()
 
 
-if __name__ == "__main__":
+def main():
     app = LoudnessWindow()
     app.run()
+
+
+if __name__ == "__main__":
+    main()
