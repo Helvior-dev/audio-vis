@@ -22,12 +22,27 @@ from OpenGL.GL import *
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
+from text_render import TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, TextRenderer
 
 FFT_SIZE = 2048
 NUM_BARS = 64
 DB_FLOOR = -70.0   # anything quieter than this renders as an empty bar
 DB_CEIL = 0.0
 SMOOTHING = 0.75    # 0 = no smoothing (jumpy), closer to 1 = smoother but laggier
+
+HELP_TITLE = "SPECTRUM"
+
+HELP_TEXT_LINES = [
+    "Splits the sound into its individual frequencies -- bass on",
+    "the left, treble on the right -- and shows how loud each one",
+    "is right now, on a logarithmic scale that mirrors how pitch",
+    "actually sounds to the ear.",
+    "",
+    "Taller bars mean more energy at that frequency. A bar turns",
+    "red only when that frequency is close to clipping.",
+]
+
+HELP_FOOTER = "Click anywhere to close"
 
 VERTEX_SHADER = """
 #version 330
@@ -43,6 +58,25 @@ uniform vec3 color;
 out vec4 out_color;
 void main() {
     out_color = vec4(color, 1.0);
+}
+"""
+
+# solid-color program with alpha: used for the help icon circle and the overlay panel
+SOLID_VERTEX_SHADER = """
+#version 330
+in vec2 pos;
+void main() {
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+"""
+
+SOLID_FRAGMENT_SHADER = """
+#version 330
+uniform vec3 color;
+uniform float alpha;
+out vec4 out_color;
+void main() {
+    out_color = vec4(color, alpha);
 }
 """
 
@@ -108,7 +142,12 @@ class SpectrumWindow:
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
         glfw.set_framebuffer_size_callback(self.window, self._on_resize)
+        glfw.set_cursor_pos_callback(self.window, self._on_cursor_move)
+        glfw.set_mouse_button_callback(self.window, self._on_mouse_button)
         apply_dark_titlebar(self.window)
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         self.program = link_program(VERTEX_SHADER, FRAGMENT_SHADER)
         self.color_loc = glGetUniformLocation(self.program, "color")
@@ -124,6 +163,24 @@ class SpectrumWindow:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
+        # solid-color program + VAO/VBO: shared by the help-icon circle
+        # outline and the overlay's background quads
+        self.solid_program = link_program(SOLID_VERTEX_SHADER, SOLID_FRAGMENT_SHADER)
+        self.solid_color_loc = glGetUniformLocation(self.solid_program, "color")
+        self.solid_alpha_loc = glGetUniformLocation(self.solid_program, "alpha")
+        self.solid_vao = glGenVertexArrays(1)
+        glBindVertexArray(self.solid_vao)
+        self.solid_vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.solid_vbo)
+        glBufferData(GL_ARRAY_BUFFER, 32 * 2 * 4, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        glBindVertexArray(0)
+
+        self.text_program = link_program(TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER)
+        self.text = TextRenderer(self.text_program)
+
         self.read_chunk_size = 256
         self.audio = AudioCapture(chunk_size=self.read_chunk_size)
         self.rolling_buffer = np.zeros(FFT_SIZE, dtype=np.float32)
@@ -132,9 +189,37 @@ class SpectrumWindow:
         self.actual_num_bars = len(self.bin_edges) - 1
         self.smoothed_db = np.full(self.actual_num_bars, DB_FLOOR, dtype=np.float32)
 
+        self.mouse_x, self.mouse_y = -1.0, -1.0
+        self.help_icon_cx = 0.93
+        self.help_icon_cy = 0.85
+        self.help_icon_r = 0.045
+        self.help_open = False
+
     def _on_resize(self, window, width, height):
         self.width, self.height = width, height
         glViewport(0, 0, width, height)
+
+    def _on_cursor_move(self, window, xpos, ypos):
+        self.mouse_x, self.mouse_y = xpos, ypos
+
+    def _mouse_to_window_ndc(self, xpos, ypos):
+        if self.width <= 0 or self.height <= 0:
+            return 0.0, 0.0
+        x = (xpos / self.width) * 2.0 - 1.0
+        y = 1.0 - (ypos / self.height) * 2.0
+        return x, y
+
+    def _on_mouse_button(self, window, button, action, mods):
+        if button != glfw.MOUSE_BUTTON_LEFT or action != glfw.PRESS:
+            return
+        if self.help_open:
+            self.help_open = False
+            return
+        x, y = self._mouse_to_window_ndc(self.mouse_x, self.mouse_y)
+        dx = x - self.help_icon_cx
+        dy = y - self.help_icon_cy
+        if dx * dx + dy * dy <= self.help_icon_r * self.help_icon_r:
+            self.help_open = True
 
     def _update_audio(self):
         chunk = self.audio.read_chunk()  # (read_chunk_size, channels)
@@ -191,6 +276,75 @@ class SpectrumWindow:
             dtype=np.float32,
         )
 
+    # -----------------------------------------------------------------
+    # help icon / overlay
+    # -----------------------------------------------------------------
+
+    def _draw_quad_window(self, x0, y0, x1, y1, color, alpha=1.0):
+        glUniform3f(self.solid_color_loc, *color)
+        glUniform1f(self.solid_alpha_loc, alpha)
+        verts = self._quad_verts(x0, x1, y0, y1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.solid_vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+
+    def _draw_circle_window(self, cx, cy, r, color, alpha=1.0, segments=24):
+        if self.width <= 0 or self.height <= 0:
+            return
+        aspect = self.height / self.width
+        glUniform3f(self.solid_color_loc, *color)
+        glUniform1f(self.solid_alpha_loc, alpha)
+        angles = np.linspace(0, 2 * np.pi, segments, endpoint=True, dtype=np.float32)
+        verts = np.stack(
+            [cx + np.cos(angles) * r * aspect, cy + np.sin(angles) * r],
+            axis=1,
+        ).astype(np.float32)
+        glBindBuffer(GL_ARRAY_BUFFER, self.solid_vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
+        glDrawArrays(GL_LINE_STRIP, 0, segments)
+
+    def _draw_help_icon(self):
+        hovering = False
+        x, y = self._mouse_to_window_ndc(self.mouse_x, self.mouse_y)
+        dx, dy = x - self.help_icon_cx, y - self.help_icon_cy
+        if dx * dx + dy * dy <= self.help_icon_r * self.help_icon_r:
+            hovering = True
+
+        glUseProgram(self.solid_program)
+        glBindVertexArray(self.solid_vao)
+        icon_color = (0.75, 0.75, 0.8) if hovering else (0.5, 0.5, 0.55)
+        self._draw_circle_window(self.help_icon_cx, self.help_icon_cy, self.help_icon_r, icon_color, alpha=0.9)
+        glBindVertexArray(0)
+
+        self.text.draw("?", self.help_icon_cx, self.help_icon_cy, pixel_scale=1.1,
+                        win_w=self.width, win_h=self.height, color=icon_color,
+                        align="center", valign="middle")
+
+    def _draw_help_overlay(self):
+        glUseProgram(self.solid_program)
+        glBindVertexArray(self.solid_vao)
+        self._draw_quad_window(-1.0, -1.0, 1.0, 1.0, (0.0, 0.0, 0.0), alpha=0.72)
+        self._draw_quad_window(-0.95, -0.85, 0.95, 0.85, (0.08, 0.08, 0.1), alpha=0.97)
+        glBindVertexArray(0)
+
+        title_y = 0.68
+        self.text.draw(HELP_TITLE, 0.0, title_y, pixel_scale=1.4,
+                        win_w=self.width, win_h=self.height,
+                        color=(0.92, 0.92, 0.97), align="center")
+
+        line_h = 0.09
+        start_y = title_y - 0.20
+        for i, line in enumerate(HELP_TEXT_LINES):
+            if line:
+                self.text.draw(line, 0.0, start_y - i * line_h, pixel_scale=0.85,
+                                win_w=self.width, win_h=self.height,
+                                color=(0.7, 0.7, 0.75), align="center")
+
+        footer_y = start_y - len(HELP_TEXT_LINES) * line_h - 0.06
+        self.text.draw(HELP_FOOTER, 0.0, footer_y, pixel_scale=0.75,
+                        win_w=self.width, win_h=self.height,
+                        color=(0.55, 0.55, 0.6), align="center")
+
     def render_frame(self):
         glClearColor(0.0, 0.0, 0.0, 1.0)
         glClear(GL_COLOR_BUFFER_BIT)
@@ -228,6 +382,10 @@ class SpectrumWindow:
 
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
+
+        self._draw_help_icon()
+        if self.help_open:
+            self._draw_help_overlay()
 
     def run(self):
         try:
