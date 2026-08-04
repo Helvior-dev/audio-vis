@@ -31,20 +31,27 @@ from text_render import TextRenderer, TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, 
 # smaller = more "zoomed in" / reacts faster, larger = smoother but laggier
 HISTORY_SAMPLES = 2048
 
+# Kept as fairly short lines rather than a few long paragraphs -- the
+# window is wide and short (800x300 default, and user-resizable), so
+# short lines centered as a block use the width the overlay actually
+# has instead of collapsing into a narrow strip in one corner.
+HELP_TITLE = "OSCILLOSCOPE"
+
 HELP_TEXT_LINES = [
-    "OSCILLOSCOPE",
+    "Draws the raw shape of the sound wave as it plays,",
+    "moving left to right in real time.",
     "",
-    "Draws the raw shape of the sound wave as it plays, moving",
-    "left to right in real time. Up and down movement is how loud",
-    "the sound is at that instant -- tall spikes are loud, a flat",
-    "line near the middle is quiet.",
+    "Up and down movement is how loud the sound is at that",
+    "instant -- tall spikes are loud, a flat line near the",
+    "middle is quiet.",
     "",
-    "Fast, jagged wiggles usually mean high-pitched or noisy sound.",
-    "Slow, smooth curves usually mean bass or low tones. A dense,",
-    "busy waveform generally means a louder, more compressed mix.",
-    "",
-    "Click anywhere to close",
+    "Fast, jagged wiggles usually mean high-pitched or noisy",
+    "sound. Slow, smooth curves usually mean bass or low",
+    "tones. A dense, busy waveform generally means a louder,",
+    "more compressed mix.",
 ]
+
+HELP_FOOTER = "Click anywhere to close"
 
 VERTEX_SHADER = """
 #version 330
@@ -131,10 +138,6 @@ class WaveformWindow:
         if not self.window:
             glfw.terminate()
             raise RuntimeError("GLFW window creation failed")
-        
-        monitor = glfw.get_primary_monitor()
-        mode = glfw.get_video_mode(monitor)
-        glfw.set_window_pos(self.window, (mode.size.width - self.width) // 2, (mode.size.height - self.height) // 2)
 
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)  # vsync: cap render rate to monitor refresh (144Hz)
@@ -298,14 +301,29 @@ class WaveformWindow:
         self._draw_quad_window(-0.95, -0.85, 0.95, 0.85, (0.08, 0.08, 0.1), alpha=0.97)
         glBindVertexArray(0)
 
-        line_h = 0.11
-        start_y = 0.6
+        # title centered across the full width, body text centered as a
+        # block below it -- rather than everything left-anchored at a
+        # fixed x, which on a wide/short window like this one leaves the
+        # whole right half of the overlay empty
+        #
+        # Panel interior spans roughly y in [-0.85, 0.85] (1.7 NDC tall).
+        # line_h and title_y are chosen so title + all body lines + the
+        # footer are guaranteed to fit inside that span at any window
+        # size, instead of being tuned by eye for one particular window
+        # height and then overflowing at another (line_h=0.135 with 11
+        # lines needed ~1.5 NDC just for the body, which pushed the last
+        # couple of lines past the bottom edge of the panel).
+        title_y = 0.72
+        self._text_window(HELP_TITLE, 0.0, title_y, 1.4, (0.92, 0.92, 0.97), align="center")
+
+        line_h = 0.082
+        start_y = title_y - 0.18
         for i, line in enumerate(HELP_TEXT_LINES):
-            is_title = i == 0
-            color = (0.9, 0.9, 0.95) if is_title else (0.68, 0.68, 0.73)
-            scale = 1.3 if is_title else 0.95
             if line:
-                self._text_window(line, -0.88, start_y - i * line_h, scale, color, align="left")
+                self._text_window(line, 0.0, start_y - i * line_h, 0.72, (0.7, 0.7, 0.75), align="center")
+
+        footer_y = start_y - len(HELP_TEXT_LINES) * line_h - 0.05
+        self._text_window(HELP_FOOTER, 0.0, footer_y, 0.7, (0.55, 0.55, 0.6), align="center")
 
     def render_frame(self):
         # must bind the buffer before writing to it -- glBufferSubData

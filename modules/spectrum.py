@@ -100,11 +100,10 @@ class SpectrumWindow:
         if not self.window:
             glfw.terminate()
             raise RuntimeError("GLFW window creation failed")
-        
+
         monitor = glfw.get_primary_monitor()
         mode = glfw.get_video_mode(monitor)
         glfw.set_window_pos(self.window, (mode.size.width - self.width) // 2, (mode.size.height - self.height) // 2)
-
 
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
@@ -143,6 +142,19 @@ class SpectrumWindow:
             return
         mono = chunk.mean(axis=1).astype(np.float32)
         n = len(mono)
+
+        # A window resize/drag stalls the render loop for a bit (GLFW
+        # blocks pumping frames during the native resize drag on
+        # Windows), so several audio callbacks' worth of chunks pile up
+        # in AudioCapture's queue. The next read_chunk() call then
+        # returns all of them concatenated -- n can come back larger
+        # than FFT_SIZE (rolling_buffer's fixed size). Only the most
+        # recent FFT_SIZE samples are relevant to the rolling window
+        # anyway, so trim before the roll/assign -- same fix as
+        # spectrum_analyzer.py's _update_audio.
+        if n > FFT_SIZE:
+            mono = mono[-FFT_SIZE:]
+            n = FFT_SIZE
 
         # slide the rolling buffer and append the new samples at the end
         self.rolling_buffer = np.roll(self.rolling_buffer, -n)
