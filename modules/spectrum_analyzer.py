@@ -7,24 +7,6 @@ a blue peak-hold envelope line drawn on top, frequency axis labels
 (100Hz / 1kHz / 10kHz) across the top, vertical gridlines at those same
 frequencies, and a hover tooltip showing dB / Hz / nearest musical note
 under the cursor.
-
-Rendering approach:
-  - Bars: one GL_TRIANGLES draw call for all bars, vertex color = per-bar
-    colormap value baked into the vertex buffer each frame (position +
-    color interleaved). Far cheaper than hundreds of draw calls or
-    hundreds of uniform changes.
-  - Envelope: GL_LINE_STRIP over each bar's per-bin peak-hold value,
-    solid blue, slightly translucent via alpha blending. See
-    PEAK_HOLD_SEC / PEAK_FALL_DB_PER_SEC below for the hold-then-decay
-    behavior -- this is a peak marker per frequency bin, the same
-    "jump up instantly, hang for a moment, ease back down" ballistics
-    as the peak ticks in vu.py and loudness.py, just one per bar instead
-    of one per channel.
-  - Frequency labels + hover text: rasterized once per string into an
-    8x8-per-glyph bitmap (numpy-generated bitmap font, no external font
-    file needed) and uploaded as a texture, drawn as a textured quad.
-    This is simpler and more legible than extending the 7-segment digit
-    renderer (vu.py's SEGMENT_MAP) to handle letters like H/z/k/#/+/-.
 """
 
 import sys
@@ -35,10 +17,11 @@ import glfw
 import numpy as np
 from OpenGL.GL import *
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
 from text_render import TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, TextRenderer
+from audio_source_config import load_selected_source, SourceWatcher
 
 FFT_SIZE = 4096
 NUM_BARS = 320          # dense, thin bars -- close to the reference density
@@ -46,13 +29,6 @@ DB_FLOOR = -70.0
 DB_CEIL = 0.0
 SMOOTHING = 0.65         # bar smoothing (lower than spectrum.py -- reference looks fairly live)
 
-# Peak-hold envelope ballistics: on a new higher value, jump up
-# immediately (no attack smoothing -- a peak should register the instant
-# it happens). Then hold that value for PEAK_HOLD_SEC before it's
-# allowed to start falling, and fall at PEAK_FALL_DB_PER_SEC once it
-# does -- this is what reads as the line "hanging" for a beat and then
-# gently sliding back down onto the bars, rather than tracking them
-# continuously like a second smoothed copy of the bars would.
 PEAK_HOLD_SEC = 0.09
 PEAK_FALL_DB_PER_SEC = 100.0
 
@@ -164,26 +140,11 @@ def link_program(vertex_src: str, fragment_src: str) -> int:
 
 
 def make_log_bin_edges(num_bars: int, fft_size: int, min_bin: float = 1.0) -> np.ndarray:
-    """
-    Returns num_bars+1 log-spaced edges as FLOATS (not deduplicated
-    integer bin indices). Using float edges + interpolation (see
-    _update_audio) instead of integer-bin grouping is what lets NUM_BARS
-    be honored exactly even when it's larger than the number of distinct
-    low-frequency FFT bins available -- grouping by rounded integer bins
-    collapses many adjacent log-spaced edges into the same bin at low
-    frequencies and silently caps the achievable bar count well below
-    what a dense reference-style display needs.
-    """
     max_bin = fft_size // 2
     return np.logspace(np.log10(min_bin), np.log10(max_bin), num_bars + 1)
 
 
 def colormap(level: np.ndarray) -> np.ndarray:
-    """
-    Vectorized version of the same dark-purple -> magenta -> orange ramp
-    used in spectrogram.py, applied per-bar instead of per-texel.
-    level: array shape (N,) in 0..1. Returns array shape (N, 3).
-    """
     dark_purple = np.array([0.10, 0.02, 0.15])
     magenta = np.array([0.75, 0.15, 0.55])
     orange = np.array([1.00, 0.55, 0.15])
@@ -199,7 +160,6 @@ def colormap(level: np.ndarray) -> np.ndarray:
     return np.where(is_high, high_mix, low_mix)
 
 
-
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
@@ -210,12 +170,11 @@ def freq_to_note(freq_hz: float) -> str:
     semitones_from_a4 = 12.0 * np.log2(freq_hz / 440.0)
     nearest = round(semitones_from_a4)
     cents = int(round((semitones_from_a4 - nearest) * 100))
-    midi_note = 69 + nearest  # A4 = MIDI 69
+    midi_note = 69 + nearest
     name = NOTE_NAMES[midi_note % 12]
     octave = midi_note // 12 - 1
     sign = "+" if cents >= 0 else "-"
     return f"{name}{octave} {sign}{abs(cents)}Cents"
-
 
 
 class SpectrumAnalyzerWindow:
@@ -251,24 +210,21 @@ class SpectrumAnalyzerWindow:
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        # --- bar program (per-vertex color) ---
         self.bar_program = link_program(BAR_VERTEX_SHADER, BAR_FRAGMENT_SHADER)
         self.bar_vao = glGenVertexArrays(1)
         glBindVertexArray(self.bar_vao)
         self.bar_vbo = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.bar_vbo)
-        # 6 verts per bar (2 triangles) * NUM_BARS, 5 floats per vert (pos2+color3)
         self.max_bar_verts = NUM_BARS * 6
         glBufferData(GL_ARRAY_BUFFER, self.max_bar_verts * 5 * 4, None, GL_DYNAMIC_DRAW)
         stride = 5 * 4
-        glEnableVertexAttribArray(0)  # pos
+        glEnableVertexAttribArray(0)
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
-        glEnableVertexAttribArray(1)  # color
+        glEnableVertexAttribArray(1)
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(2 * 4))
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        # --- line program (envelope + gridlines) ---
         self.line_program = link_program(LINE_VERTEX_SHADER, LINE_FRAGMENT_SHADER)
         self.line_color_loc = glGetUniformLocation(self.line_program, "color")
         self.line_vao = glGenVertexArrays(1)
@@ -281,7 +237,6 @@ class SpectrumAnalyzerWindow:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        # --- solid program (help icon + overlay panel) ---
         self.solid_program = link_program(SOLID_VERTEX_SHADER, SOLID_FRAGMENT_SHADER)
         self.solid_color_loc = glGetUniformLocation(self.solid_program, "color")
         self.solid_alpha_loc = glGetUniformLocation(self.solid_program, "alpha")
@@ -295,41 +250,40 @@ class SpectrumAnalyzerWindow:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        # --- text program ---
         self.text_program = link_program(TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER)
         self.text = TextRenderer(self.text_program)
 
-        # --- audio / FFT state ---
         self.read_chunk_size = 256
-        self.audio = AudioCapture(chunk_size=self.read_chunk_size)
+        self.audio = AudioCapture(chunk_size=self.read_chunk_size, source=load_selected_source())
+        self.source_watcher = SourceWatcher()
         self.rolling_buffer = np.zeros(FFT_SIZE, dtype=np.float32)
         self.window_fn = np.hanning(FFT_SIZE).astype(np.float32)
-        self.bin_edges = make_log_bin_edges(NUM_BARS, FFT_SIZE)  # float edges, length NUM_BARS+1
+        self.bin_edges = make_log_bin_edges(NUM_BARS, FFT_SIZE)
         self.actual_num_bars = NUM_BARS
         self.smoothed_db = np.full(self.actual_num_bars, DB_FLOOR, dtype=np.float32)
 
-        # per-bar peak-hold state: current displayed peak value, and how
-        # long (in seconds) it's been since that peak was last pushed up
-        # by a new higher reading -- used to gate when the hold ends and
-        # the fall begins (see PEAK_HOLD_SEC / PEAK_FALL_DB_PER_SEC above)
         self.peak_db = np.full(self.actual_num_bars, DB_FLOOR, dtype=np.float32)
         self._peak_age = np.zeros(self.actual_num_bars, dtype=np.float32)
         self.sample_rate = self.audio.rate
         self.last_time = glfw.get_time()
 
-        # per-bar center frequency (Hz), used for axis labels + hover note lookup
-        bin_hz = self.sample_rate / FFT_SIZE
-        bar_center_bin = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2.0
-        self.bar_freqs_hz = bar_center_bin * bin_hz
-        self._fft_bin_axis = np.arange(FFT_SIZE // 2 + 1, dtype=np.float64)
+        self._recompute_bar_freqs()
 
-        # mouse / hover state
         self.mouse_x, self.mouse_y = -1.0, -1.0
         self.mouse_in_window = False
         self.help_icon_cx = 0.965
         self.help_icon_cy = 0.90
         self.help_icon_r = 0.045
         self.help_open = False
+
+    def _recompute_bar_freqs(self):
+        """Sample-rate-dependent frequency axis -- recomputed after a
+        source switch too, since a mic and the system output device can
+        run at different native sample rates."""
+        bin_hz = self.sample_rate / FFT_SIZE
+        bar_center_bin = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2.0
+        self.bar_freqs_hz = bar_center_bin * bin_hz
+        self._fft_bin_axis = np.arange(FFT_SIZE // 2 + 1, dtype=np.float64)
 
     def _on_resize(self, window, width, height):
         self.width, self.height = width, height
@@ -361,6 +315,13 @@ class SpectrumAnalyzerWindow:
             self.help_open = True
 
     def _update_audio(self):
+        new_source = self.source_watcher.check()
+        if new_source is not None:
+            self.audio.reopen(new_source)
+            self.rolling_buffer[:] = 0.0
+            self.sample_rate = self.audio.rate
+            self._recompute_bar_freqs()
+
         now = glfw.get_time()
         dt = max(1e-4, now - self.last_time)
         self.last_time = now
@@ -372,19 +333,6 @@ class SpectrumAnalyzerWindow:
         mono = chunk.mean(axis=1).astype(np.float32)
         n = len(mono)
 
-        # A window resize/drag stalls the render loop for a bit (GLFW
-        # blocks pumping frames during the native resize drag on
-        # Windows), so several audio callbacks' worth of chunks pile up
-        # in AudioCapture's queue. The next read_chunk() call then
-        # returns all of them concatenated -- n can come back larger
-        # than FFT_SIZE. rolling_buffer is a fixed-size ring of the last
-        # FFT_SIZE samples, so only the most recent FFT_SIZE samples of
-        # mono are relevant to it; anything older is already outside the
-        # analysis window and would overflow the buffer[-n:] assignment
-        # below if kept. Trimming here (rather than only when n >=
-        # FFT_SIZE) is the same operation either way -- np.roll with
-        # n == 0 after trimming would be a no-op, so no separate branch
-        # is needed for the "huge n" case vs. the normal case.
         if n > FFT_SIZE:
             mono = mono[-FFT_SIZE:]
             n = FFT_SIZE
@@ -396,32 +344,14 @@ class SpectrumAnalyzerWindow:
         spectrum = np.fft.rfft(windowed)
         magnitude = np.abs(spectrum) / (self.window_fn.sum() / 2)
 
-        # sample the (linearly-interpolated) magnitude spectrum at several
-        # points across each bar's [lo, hi) float bin-edge span and average
-        # them -- this is the float-edge equivalent of the old integer
-        # magnitude[lo:hi].mean(), but works when hi-lo < 1 (which happens
-        # constantly at low frequencies once NUM_BARS exceeds the number
-        # of whole FFT bins available there)
         SUBSAMPLES = 6
         lo = self.bin_edges[:-1]
         hi = np.maximum(self.bin_edges[1:], lo + 1e-6)
-        t = (np.arange(SUBSAMPLES) + 0.5) / SUBSAMPLES  # shape (SUBSAMPLES,)
-        sample_positions = lo[:, None] + t[None, :] * (hi - lo)[:, None]  # (num_bars, SUBSAMPLES)
+        t = (np.arange(SUBSAMPLES) + 0.5) / SUBSAMPLES
+        sample_positions = lo[:, None] + t[None, :] * (hi - lo)[:, None]
         sampled = np.interp(sample_positions.ravel(), self._fft_bin_axis, magnitude)
         bar_magnitudes = sampled.reshape(self.actual_num_bars, SUBSAMPLES).mean(axis=1).astype(np.float32)
 
-        # smoothing across neighboring bars (frequency axis, not time).
-        # At low frequencies, NUM_BARS=320 log-spaced bars pack far more
-        # bars than there are whole FFT bins to sample from -- many
-        # adjacent bars end up reading nearly the same underlying data,
-        # but the small residual differences between them, combined with
-        # the geometric gap drawn between every bar, showed up as thin
-        # dark vertical seams cutting through what should read as one
-        # solid peak (visible on wide low-frequency bars especially). A
-        # wider 5-tap weighted average blends each bar much more heavily
-        # with its immediate neighbors than the previous 3-tap version
-        # did, which is enough to flatten that residual noise while
-        # still preserving the real shape of distinct spectral peaks.
         bar_magnitudes = (
             np.roll(bar_magnitudes, 2) * 0.08
             + np.roll(bar_magnitudes, 1) * 0.22
@@ -438,14 +368,6 @@ class SpectrumAnalyzerWindow:
         self._update_peak_hold(dt, db)
 
     def _update_peak_hold(self, dt: float, db: np.ndarray = None):
-        """
-        Per-bar peak-hold ballistics, vectorized across all bars at once
-        (same shape of logic as the single-value peak ticks in vu.py /
-        loudness.py, just NUM_BARS of them in parallel via numpy instead
-        of one scalar). db=None means this call had no new audio (see
-        the chunk-is-None branch in _update_audio) -- the peaks still
-        age and fall, they just have nothing new to possibly jump up to.
-        """
         if db is not None:
             rising = db > self.peak_db
             self.peak_db = np.where(rising, db, self.peak_db)
@@ -462,7 +384,6 @@ class SpectrumAnalyzerWindow:
         )
 
     def _freq_to_x_ndc(self, freq_hz: float) -> float:
-        """Log-scale mapping of a frequency to NDC x, across MIN_FREQ_HZ..MAX_FREQ_HZ."""
         freq_hz = max(freq_hz, MIN_FREQ_HZ)
         t = np.log10(freq_hz / MIN_FREQ_HZ) / np.log10(MAX_FREQ_HZ / MIN_FREQ_HZ)
         t = min(max(t, 0.0), 1.0)
@@ -474,9 +395,6 @@ class SpectrumAnalyzerWindow:
         level = np.clip(level, 0.0, 1.0)
         colors = colormap(level)
 
-        # x positions: log-spaced across the full width like the reference
-        # (not evenly spaced by bar index -- low bars are wide, high bars thin),
-        # computed directly from the float bin_edges -> Hz -> NDC
         bin_hz = self.sample_rate / FFT_SIZE
         edge_freqs = self.bin_edges * bin_hz
         x_edges = np.array([self._freq_to_x_ndc(f) for f in edge_freqs], dtype=np.float32)
@@ -484,18 +402,6 @@ class SpectrumAnalyzerWindow:
         y0 = -1.0
         verts = np.zeros((n * 6, 5), dtype=np.float32)
 
-        # Gap is capped in absolute NDC terms, not just as a fraction of
-        # each bar's own width. At NUM_BARS=320 on a log scale, bars
-        # above roughly 1-2kHz become only a few NDC-thousandths wide --
-        # a purely proportional gap (old: width * 0.12) shrinks with the
-        # bar, sure, but the bar itself is already near the rendering
-        # floor, so gap + antialiasing + the fixed minimum-width clamp
-        # below combined to eat most or all of the visible bar on the
-        # right two-thirds of the spectrum, reading as "gaps in the
-        # fill" rather than a deliberate bar/gap pattern. Capping the
-        # gap at a small absolute width keeps the thin high-frequency
-        # bars solid while still leaving a visible seam between bars
-        # that are wide enough for one to matter.
         gap_frac = 0.0
         max_gap_ndc = 0.0
         min_bar_width_ndc = 0.0012
@@ -521,26 +427,10 @@ class SpectrumAnalyzerWindow:
             verts[base + 4] = [bx1, y1, c[0], c[1], c[2]]
             verts[base + 5] = [bx0, y1, c[0], c[1], c[2]]
 
-        self._bar_x_edges = x_edges  # cached for hover lookup
+        self._bar_x_edges = x_edges
         return verts.reshape(-1)
 
     def _build_envelope_vertices(self) -> np.ndarray:
-        """
-        Only the bars whose center frequency falls at or below
-        MAX_FREQ_HZ are included. A handful of the highest bars can have
-        a center frequency slightly above MAX_FREQ_HZ (FFT_SIZE=4096 at
-        a 44.1/48kHz sample rate puts Nyquist a bit past 20kHz, and the
-        log-spaced bin edges land some bar centers up there too) --
-        _freq_to_x_ndc clips anything past MAX_FREQ_HZ to the same x=1.0
-        edge, so several of those trailing bars used to collapse onto
-        one vertical line of x with different y (peak) values, and
-        GL_LINE_STRIP drew that as a stray vertical stroke at the right
-        edge instead of a smooth line ending. Dropping them from the
-        strip (rather than letting them all render at x=1.0) removes
-        that artifact; the same bars are effectively invisible in the
-        bar fill anyway since they're squeezed into that same 0-width
-        column.
-        """
         n = self.actual_num_bars
         visible = self.bar_freqs_hz <= MAX_FREQ_HZ
         level = (self.peak_db - DB_FLOOR) / (DB_CEIL - DB_FLOOR)
@@ -603,13 +493,11 @@ class SpectrumAnalyzerWindow:
 
         x_ndc = (self.mouse_x / self.width) * 2.0 - 1.0
         y_ndc = 1.0 - (self.mouse_y / self.height) * 2.0
-        # keep the label from running off the right edge
         label_x = min(x_ndc, 0.5)
         self.text.draw(text, label_x, min(y_ndc + 0.05, 0.95), pixel_scale=2.5,
                         win_w=self.width, win_h=self.height,
                         color=(0.95, 0.95, 0.95), align="left")
 
-        # vertical marker line at the hovered bar
         glUseProgram(self.line_program)
         glUniform4f(self.line_color_loc, 0.9, 0.9, 0.95, 0.5)
         glBindVertexArray(self.line_vao)
@@ -696,7 +584,6 @@ class SpectrumAnalyzerWindow:
 
         self._draw_gridlines()
 
-        # bars
         bar_verts = self._build_bar_vertices()
         glUseProgram(self.bar_program)
         glBindVertexArray(self.bar_vao)
@@ -706,7 +593,6 @@ class SpectrumAnalyzerWindow:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        # peak-hold envelope line on top -- blue, matching the reference
         env_verts, env_count = self._build_envelope_vertices()
         glUseProgram(self.line_program)
         glUniform4f(self.line_color_loc, 0.98, 0.55, 0.65, 0.9)

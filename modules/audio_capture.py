@@ -1,9 +1,14 @@
 """
-System audio loopback capture (Windows WASAPI via pyaudiowpatch).
+Audio capture (Windows WASAPI via pyaudiowpatch), with a selectable
+source: either system loopback (what's playing on an output device) or
+a real microphone/line-in.
 
-This captures what's actually playing on your speakers/headphones
-(loopback), not microphone input. Each visualization module will
-import AudioCapture and read the latest samples from it.
+Each visualization module imports AudioCapture and reads the latest
+samples from it. The active source can be changed at any time via
+reopen(source) -- this tears down and recreates the underlying
+PortAudio stream in place, without needing a new AudioCapture instance,
+which is what lets already-open visualizer windows pick up a source
+change made from the launcher without restarting.
 
 Uses PyAudio's callback mode instead of blocking stream.read(). In
 blocking mode, read_chunk() calls stream.read() directly on the GUI
@@ -44,6 +49,7 @@ before wiring up any visuals.
 
 import queue
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -55,14 +61,97 @@ import pyaudiowpatch as pyaudio
 # triggers it
 SILENCE_TIMEOUT_SEC = 0.15
 
+KIND_LOOPBACK = "loopback"     # system audio: capture what an output device is playing
+KIND_MICROPHONE = "microphone"  # a real input device (mic, line-in)
+
+
+@dataclass(frozen=True)
+class AudioSource:
+    """
+    Identifies where to capture from. `kind` picks loopback vs
+    microphone; `device_index` is a specific PyAudio device index, or
+    None to mean "whatever WASAPI currently considers the default for
+    that kind" (so e.g. "default microphone" keeps tracking the OS
+    default even if the user changes it in Windows settings later).
+
+    `name` is display-only, carried along so callers/config files don't
+    need a separate device lookup just to show what's selected.
+    """
+    kind: str = KIND_LOOPBACK
+    device_index: int | None = None
+    name: str = "Default system audio"
+
+    def as_dict(self) -> dict:
+        return {"kind": self.kind, "device_index": self.device_index, "name": self.name}
+
+    @staticmethod
+    def from_dict(d: dict) -> "AudioSource":
+        return AudioSource(
+            kind=d.get("kind", KIND_LOOPBACK),
+            device_index=d.get("device_index"),
+            name=d.get("name", "Default system audio"),
+        )
+
+
+def list_audio_sources() -> tuple[list[AudioSource], list[AudioSource]]:
+    """
+    Enumerates available sources. Returns (loopback_sources, microphone_sources).
+
+    loopback_sources: one entry per output device that has (or can be
+    mapped to) a WASAPI loopback counterpart -- selecting one captures
+    whatever that device is currently playing.
+
+    microphone_sources: one entry per WASAPI input device that is NOT a
+    loopback device -- i.e. an actual microphone / line-in.
+
+    Each list's first entry is a "Default ..." pseudo-source
+    (device_index=None) that always tracks the OS default at open time,
+    so it stays correct if the user changes their default device later
+    without needing to reselect anything here.
+    """
+    pa = pyaudio.PyAudio()
+    try:
+        loopback_sources = [AudioSource(KIND_LOOPBACK, None, "Default system audio")]
+        mic_sources = [AudioSource(KIND_MICROPHONE, None, "Default microphone")]
+
+        seen_loopback_names = set()
+        for dev in pa.get_loopback_device_info_generator():
+            name = dev["name"]
+            if name in seen_loopback_names:
+                continue
+            seen_loopback_names.add(name)
+            loopback_sources.append(AudioSource(KIND_LOOPBACK, dev["index"], name))
+
+        try:
+            wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        except OSError:
+            wasapi_info = None
+
+        if wasapi_info is not None:
+            for i in range(pa.get_device_count()):
+                dev = pa.get_device_info_by_index(i)
+                if dev.get("hostApi") != wasapi_info["index"]:
+                    continue
+                if dev.get("isLoopbackDevice", False):
+                    continue
+                if int(dev.get("maxInputChannels", 0)) <= 0:
+                    continue
+                mic_sources.append(AudioSource(KIND_MICROPHONE, dev["index"], dev["name"]))
+
+        return loopback_sources, mic_sources
+    finally:
+        pa.terminate()
+
 
 class AudioCapture:
-    def __init__(self, chunk_size: int = 1024):
+    def __init__(self, chunk_size: int = 1024, source: AudioSource | None = None):
         self.chunk_size = chunk_size
         self.pa = pyaudio.PyAudio()
         self.stream = None
         self.channels = 2
         self.rate = 44100
+        self.source = source or AudioSource()
+        self.last_error = None
 
         # bounded queue of raw chunks from the callback thread; bounded
         # so a stalled consumer can't leak memory, though normal use
@@ -72,10 +161,13 @@ class AudioCapture:
         self._silence = None  # a single silent chunk, returned on sustained underrun
         self._last_data_time = time.monotonic()
 
-        self._open_loopback_stream()
+        self._open_stream(self.source)
 
-    def _open_loopback_stream(self):
-        # find default WASAPI speaker device, then its loopback counterpart
+    def _resolve_device(self, source: AudioSource) -> dict:
+        """Returns the PyAudio device-info dict to open for the given source."""
+        if source.device_index is not None:
+            return self.pa.get_device_info_by_index(source.device_index)
+
         try:
             wasapi_info = self.pa.get_host_api_info_by_type(pyaudio.paWASAPI)
         except OSError:
@@ -83,23 +175,32 @@ class AudioCapture:
                 "WASAPI not available. pyaudiowpatch requires Windows."
             )
 
+        if source.kind == KIND_MICROPHONE:
+            return self.pa.get_device_info_by_index(wasapi_info["defaultInputDevice"])
+
+        # default loopback: default *output* device, mapped to its loopback twin
         default_speakers = self.pa.get_device_info_by_index(
             wasapi_info["defaultOutputDevice"]
         )
-
         if not default_speakers.get("isLoopbackDevice", False):
-            # need to find the loopback-flagged version of this device
             for loopback in self.pa.get_loopback_device_info_generator():
                 if default_speakers["name"] in loopback["name"]:
-                    default_speakers = loopback
-                    break
-            else:
-                raise RuntimeError(
-                    f"Could not find loopback device for: {default_speakers['name']}"
-                )
+                    return loopback
+            raise RuntimeError(
+                f"Could not find loopback device for: {default_speakers['name']}"
+            )
+        return default_speakers
 
-        self.channels = int(default_speakers["maxInputChannels"])
-        self.rate = int(default_speakers["defaultSampleRate"])
+    def _open_stream(self, source: AudioSource):
+        device = self._resolve_device(source)
+
+        # a loopback capture device already reports maxInputChannels for
+        # what it can hand back (usually 2); a real input device (mic)
+        # reports its own channel count the same way -- either way this
+        # is "how many channels will frames_per_buffer worth of data
+        # contain", so no branching needed between the two kinds here
+        self.channels = max(1, int(device.get("maxInputChannels", 2)))
+        self.rate = int(device["defaultSampleRate"])
         self._silence = np.zeros((self.chunk_size, self.channels), dtype=np.float32)
 
         self.stream = self.pa.open(
@@ -108,10 +209,46 @@ class AudioCapture:
             rate=self.rate,
             frames_per_buffer=self.chunk_size,
             input=True,
-            input_device_index=default_speakers["index"],
+            input_device_index=device["index"],
             stream_callback=self._on_audio,
         )
         self.stream.start_stream()
+
+    def reopen(self, source: AudioSource):
+        """
+        Switches the capture to a new source in place. Safe to call at
+        any time from the render loop (not from the audio callback
+        thread) -- e.g. every frame after checking whether the user's
+        selection changed. On failure, the previous stream stays closed
+        and reading returns silence rather than crashing the
+        visualizer; last_error is set so callers can surface it if they
+        want to.
+        """
+        if self.stream is not None:
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except OSError:
+                pass
+            self.stream = None
+
+        # drop anything queued from the old source so the next
+        # read_chunk() doesn't hand back a mix of old-source and
+        # new-source audio
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        self.last_error = None
+        try:
+            self._open_stream(source)
+            self.source = source
+        except (RuntimeError, OSError) as exc:
+            self.last_error = str(exc)
+            self.stream = None
+        self._last_data_time = time.monotonic()
 
     def _on_audio(self, in_data, frame_count, time_info, status):
         # runs on PortAudio's own thread, never the GUI thread -- must
@@ -145,11 +282,14 @@ class AudioCapture:
           render loop polling faster than audio arrives, not an actual
           gap in playback.
         - No new audio for longer than SILENCE_TIMEOUT_SEC (playback is
-          genuinely paused/stopped): returns a real silent chunk, so
-          the visualization settles to quiet instead of either freezing
-          on stale data or leaving every caller to implement its own
-          timeout.
+          genuinely paused/stopped, or reopen() failed and there is no
+          stream): returns a real silent chunk, so the visualization
+          settles to quiet instead of either freezing on stale data or
+          leaving every caller to implement its own timeout.
         """
+        if self.stream is None:
+            return self._silence
+
         chunks = []
         try:
             while True:
@@ -175,7 +315,16 @@ class AudioCapture:
 
 
 if __name__ == "__main__":
-    print("Opening loopback stream... play some audio now.")
+    loopback_sources, mic_sources = list_audio_sources()
+    print("Loopback (system audio) sources:")
+    for s in loopback_sources:
+        print(f"  [{s.device_index}] {s.name}")
+    print("Microphone sources:")
+    for s in mic_sources:
+        print(f"  [{s.device_index}] {s.name}")
+    print()
+
+    print("Opening default loopback stream... play some audio now.")
     cap = AudioCapture(chunk_size=256)
     print(f"Capturing: {cap.channels} channels @ {cap.rate} Hz, chunk_size=256")
     print("Measuring read_chunk() return sizes for 5 seconds (None counted separately)...")

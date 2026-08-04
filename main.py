@@ -14,6 +14,8 @@ import tkinter as tk
 from pathlib import Path
 
 from modules.window_utils import apply_dark_titlebar_tk
+from modules.audio_capture import AudioSource, list_audio_sources
+from modules.audio_source_config import save_selected_source, load_selected_source
 
 MODULES_DIR = Path(__file__).parent / "modules"
 
@@ -137,6 +139,136 @@ class ModuleButton(tk.Canvas):
         self._draw()
 
 
+class SourceSelectorButton(tk.Canvas):
+    """
+    Header control showing the currently selected audio source
+    ("Default system audio", a specific device name, "Default
+    microphone", ...). Clicking it opens a small popup menu grouped
+    into "System audio" and "Microphone" sections; picking an entry
+    saves it to the shared config file, which every already-open
+    visualizer window picks up on its own within a frame or two (see
+    SourceWatcher in audio_source_config.py) -- nothing here talks to
+    the running subprocesses directly.
+    """
+
+    WIDTH, HEIGHT = 320, 34
+    ICON_COLOR = "#7fb8e0"
+
+    def __init__(self, parent, on_change=None):
+        super().__init__(
+            parent, width=self.WIDTH, height=self.HEIGHT,
+            bg=BG, highlightthickness=0, bd=0, cursor="hand2",
+        )
+        self.on_change = on_change
+        self._hover = False
+        self.current: AudioSource = load_selected_source()
+        self._popup: tk.Toplevel | None = None
+
+        self._draw()
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", lambda _e: self._open_popup())
+
+    def _draw(self):
+        self.delete("all")
+        bg = CARD_BG_HOVER if self._hover else CARD_BG
+        round_rect(self, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, radius=9,
+                   fill=bg, outline=CARD_BORDER, width=1)
+
+        # small mic/speaker glyph so the control reads as audio-source-y
+        # at a glance, not just a generic settings button
+        cx, cy = 18, self.HEIGHT / 2
+        if self.current.kind == "microphone":
+            self.create_oval(cx - 4, cy - 7, cx + 4, cy + 2, outline=self.ICON_COLOR, width=1.4)
+            self.create_line(cx, cy + 2, cx, cy + 7, fill=self.ICON_COLOR, width=1.4)
+            self.create_line(cx - 5, cy + 7, cx + 5, cy + 7, fill=self.ICON_COLOR, width=1.4)
+        else:
+            self.create_rectangle(cx - 6, cy - 4, cx - 2, cy + 4, outline=self.ICON_COLOR, width=1.4)
+            self.create_polygon(cx - 2, cy - 4, cx + 5, cy - 8, cx + 5, cy + 8, cx - 2, cy + 4,
+                                 outline=self.ICON_COLOR, fill="", width=1.4)
+
+        label = self.current.name
+        if len(label) > 30:
+            label = label[:29] + "\u2026"
+        self.create_text(
+            32, self.HEIGHT / 2, text=label, anchor="w",
+            fill=TEXT_PRIMARY, font=("Segoe UI", 9),
+        )
+
+        # small chevron on the right, hinting this opens something
+        chevron_x = self.WIDTH - 16
+        self.create_line(chevron_x - 4, self.HEIGHT / 2 - 3, chevron_x, self.HEIGHT / 2 + 2,
+                          chevron_x + 4, self.HEIGHT / 2 - 3, fill=TEXT_MUTED, width=1.4,
+                          joinstyle="round", capstyle="round")
+
+    def _on_enter(self, _event):
+        self._hover = True
+        self._draw()
+
+    def _on_leave(self, _event):
+        self._hover = False
+        self._draw()
+
+    def _open_popup(self):
+        if self._popup is not None and tk.Toplevel.winfo_exists(self._popup):
+            self._popup.destroy()
+            self._popup = None
+            return
+
+        loopback_sources, mic_sources = list_audio_sources()
+
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.configure(bg=CARD_BG, highlightthickness=1, highlightbackground=CARD_BORDER)
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.HEIGHT + 4
+        popup.geometry(f"+{x}+{y}")
+        self._popup = popup
+
+        def add_section(title, sources):
+            tk.Label(
+                popup, text=title, bg=CARD_BG, fg=TEXT_MUTED,
+                font=("Segoe UI", 8, "bold"), anchor="w",
+            ).pack(fill="x", padx=10, pady=(8, 2))
+            for src in sources:
+                is_current = (src.kind == self.current.kind and src.device_index == self.current.device_index)
+                row = tk.Label(
+                    popup, text=("\u2713  " if is_current else "    ") + src.name,
+                    bg=CARD_BG, fg=(TEXT_PRIMARY if is_current else TEXT_MUTED),
+                    font=("Segoe UI", 9), anchor="w", cursor="hand2",
+                )
+                row.pack(fill="x", padx=10, pady=1)
+
+                def choose(_e, s=src):
+                    self._select(s)
+                    popup.destroy()
+                    self._popup = None
+
+                row.bind("<Button-1>", choose)
+                row.bind("<Enter>", lambda _e, w=row: w.configure(bg=CARD_BG_HOVER))
+                row.bind("<Leave>", lambda _e, w=row: w.configure(bg=CARD_BG))
+
+        add_section("SYSTEM AUDIO", loopback_sources)
+        add_section("MICROPHONE", mic_sources)
+        tk.Frame(popup, bg=CARD_BG, height=8).pack(fill="x")
+
+        # close the popup if the user clicks anywhere else
+        def on_focus_out(_e=None):
+            if self._popup is not None:
+                self._popup.destroy()
+                self._popup = None
+
+        popup.bind("<FocusOut>", on_focus_out)
+        popup.after(50, popup.focus_force)
+
+    def _select(self, source: AudioSource):
+        self.current = source
+        save_selected_source(source)
+        self._draw()
+        if self.on_change:
+            self.on_change(source)
+
+
 class Launcher:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -155,6 +287,9 @@ class Launcher:
             header, text="real-time audio meters", bg=BG, fg=TEXT_MUTED,
             font=("Segoe UI", 9),
         ).pack(anchor="w", pady=(2, 0))
+
+        self.source_selector = SourceSelectorButton(header)
+        self.source_selector.pack(anchor="w", pady=(10, 0))
 
         divider = tk.Frame(root, bg=CARD_BORDER, height=1)
         divider.pack(fill="x", padx=26, pady=(14, 4))

@@ -22,10 +22,11 @@ import glfw
 import numpy as np
 from OpenGL.GL import *
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
 from text_render import TextRenderer, TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, link_program as text_link_program
+from audio_source_config import load_selected_source, SourceWatcher
 
 # how many samples wide the visible waveform window is;
 # smaller = more "zoomed in" / reacts faster, larger = smoother but laggier
@@ -192,7 +193,8 @@ class WaveformWindow:
 
         self.history = np.zeros(HISTORY_SAMPLES, dtype=np.float32)
 
-        self.audio = AudioCapture(chunk_size=256)
+        self.audio = AudioCapture(chunk_size=256, source=load_selected_source())
+        self.source_watcher = SourceWatcher()
 
         # help icon, positioned in window-space NDC like stereometer.py's
         self.help_icon_cx = 0.93
@@ -228,6 +230,10 @@ class WaveformWindow:
             self.help_open = True
 
     def _update_audio(self):
+        new_source = self.source_watcher.check()
+        if new_source is not None:
+            self.audio.reopen(new_source)
+
         chunk = self.audio.read_chunk()  # shape (N, channels)
         if chunk is None:
             return

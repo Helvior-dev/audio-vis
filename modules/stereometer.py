@@ -31,10 +31,11 @@ import glfw
 import numpy as np
 from OpenGL.GL import *
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar, remove_titlebar_icon
 from text_render import TextRenderer, TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, link_program as text_link_program
+from audio_source_config import load_selected_source, SourceWatcher
 
 HISTORY_POINTS = 1024  # how many recent samples are plotted as dots
 
@@ -179,7 +180,8 @@ class VectorscopeWindow:
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        self.audio = AudioCapture(chunk_size=256)
+        self.audio = AudioCapture(chunk_size=256, source=load_selected_source())
+        self.source_watcher = SourceWatcher()
         self.points = np.zeros((HISTORY_POINTS, 2), dtype=np.float32)
         self.correlation = 0.0
         self.displayed_correlation = 0.0
@@ -238,7 +240,14 @@ class VectorscopeWindow:
         dt = max(1e-4, now - self.last_time)
         self.last_time = now
 
-        chunk = self.audio.read_chunk()  # (N, 2) or None
+        new_source = self.source_watcher.check()
+        if new_source is not None:
+            self.audio.reopen(new_source)
+            self.points[:] = 0.0
+            self.correlation = 0.0
+            self.displayed_correlation = 0.0
+
+        chunk = self.audio.read_chunk()  # (N, channels) or None
         if chunk is None:
             # nothing new since the last frame (render loop polled
             # faster than the next audio callback) -- not silence, just
@@ -246,8 +255,20 @@ class VectorscopeWindow:
             # still needs dt tracked via last_time above even when we
             # skip the rest of this update
             return
-        left = chunk[:, 0]
-        right = chunk[:, 1]
+
+        # a microphone source may report a single channel -- the
+        # vectorscope's whole point is the L/R relationship, so with
+        # only one channel there's no "side" signal to show. Duplicate
+        # the mono channel into both L and R rather than crashing on
+        # chunk[:, 1]: mid ends up equal to the signal and side is
+        # exactly zero, which draws as an honest flat vertical line
+        # (pure mono) instead of an error.
+        if chunk.shape[1] >= 2:
+            left = chunk[:, 0]
+            right = chunk[:, 1]
+        else:
+            left = chunk[:, 0]
+            right = chunk[:, 0]
 
         mid = (left + right) * 0.5
         side = (left - right) * 0.5

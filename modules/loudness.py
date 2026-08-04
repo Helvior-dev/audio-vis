@@ -44,10 +44,11 @@ import glfw
 import numpy as np
 from OpenGL.GL import *
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
 from text_render import TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, TextRenderer
+from audio_source_config import load_selected_source, SourceWatcher
 
 DB_MIN = -60.0
 DB_MAX = 0.0
@@ -280,38 +281,17 @@ class LoudnessMeter:
         self.kw_l = KWeightingFilter(sample_rate)
         self.kw_r = KWeightingFilter(sample_rate)
 
-        # BS.1770 defines Momentary as a 400ms window, but at that length
-        # the readout visibly lags fast music (each new value is an
-        # average smeared over the last 0.4s of audio, so a hit note is
-        # still "blended in" with whatever came right before it).
-        # Shortening this to 150ms trades spec-accuracy for a snappier,
-        # more responsive on-screen number -- this display was never a
-        # certified loudness measurement tool to begin with (see module
-        # docstring), so favoring feel over strict BS.1770 compliance
-        # here is reasonable. Short-Term (3s) and Integrated are left at
-        # their spec values since those are meant to represent longer-
-        # term trends, not instant reaction.
         self.momentary_samples = max(1, int(round(0.15 * sample_rate)))
-        # Integrated Loudness gating (per BS.1770) is defined over 400ms
-        # blocks specifically -- kept separate from momentary_samples
-        # above so shortening the on-screen Momentary readout doesn't
-        # also shrink the gating blocks Integrated relies on, which
-        # would drift Integrated away from spec for no benefit (it's a
-        # long-term average, it isn't meant to react quickly anyway).
         self.gating_block_samples = max(1, int(round(0.4 * sample_rate)))
         self.shortterm_samples = max(1, int(round(3.0 * sample_rate)))
 
-        # rolling K-weighted mean-square buffer, long enough for the 3s
-        # short-term window; momentary reads the tail of the same buffer
         self._buf_sq = np.zeros(self.shortterm_samples, dtype=np.float64)
         self._filled = 0
 
-        # 400ms gating blocks sampled every 100ms (75% overlap, per spec)
         self._block_hop_samples = max(1, int(round(0.1 * sample_rate)))
         self._samples_since_block = 0
         self._integrated_blocks: list[float] = []
 
-        # short-term loudness sampled once a second, for LRA
         self._st_hop_samples = max(1, int(round(1.0 * sample_rate)))
         self._samples_since_st = 0
         self._st_history: list[float] = []
@@ -333,9 +313,6 @@ class LoudnessMeter:
         if len(left) == 0:
             return
 
-        # sample peak (true peak per spec needs 4x oversampling -- skipped
-        # here to avoid pulling in a resampler dependency; sample peak is
-        # what most lightweight real-time meters show anyway)
         chunk_peak = float(np.max(np.abs(np.concatenate([left, right]))))
         chunk_peak_db = 20.0 * np.log10(max(chunk_peak, 1e-10))
         if chunk_peak_db > self._peak_hold_db:
@@ -346,7 +323,7 @@ class LoudnessMeter:
 
         kl = self.kw_l.process(left.astype(np.float64))
         kr = self.kw_r.process(right.astype(np.float64))
-        sq = kl * kl + kr * kr  # L/R channel weight = 1.0 each, per BS.1770
+        sq = kl * kl + kr * kr
 
         n = len(sq)
         if n >= self.shortterm_samples:
@@ -479,22 +456,8 @@ class LoudnessWindow:
         mode = glfw.get_video_mode(monitor)
         glfw.set_window_pos(self.window, (mode.size.width - self.width) // 2, (mode.size.height - self.height) // 2)
 
-        # lock the resize drag to the original aspect ratio -- this is
-        # what keeps every fixed-NDC-fraction element (text, bars, ticks)
-        # landing in the same relative place at any window size, instead
-        # of stretching non-uniformly and running text into the bars
         glfw.set_window_aspect_ratio(self.window, self.base_width, self.base_height)
 
-        # a floor on how small the window can get, at the same locked
-        # aspect ratio. Text size is resolved from win_h every draw call
-        # (see text_render.py), so shrinking the window shrinks every
-        # label right along with it -- past a certain point the numbers
-        # and stat labels become too small to read even though nothing
-        # is technically broken. Half the base size is small enough to
-        # dock in a corner of the screen but still keeps text legible;
-        # GLFW_DONT_CARE on the max means it can still be enlarged
-        # (and, combined with the aspect lock above, made fullscreen-wide)
-        # without limit.
         min_width = self.base_width // 2
         min_height = self.base_height // 2
         glfw.set_window_size_limits(
@@ -524,7 +487,6 @@ class LoudnessWindow:
         self.text_program = link_program(TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER)
         self.text = TextRenderer(self.text_program)
 
-        # shared dynamic quad buffer for bars/ticks/panels (rewritten per draw)
         self.bar_vao = glGenVertexArrays(1)
         glBindVertexArray(self.bar_vao)
         self.bar_vbo = glGenBuffers(1)
@@ -545,21 +507,12 @@ class LoudnessWindow:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        self.audio = AudioCapture(chunk_size=256)
+        self.audio = AudioCapture(chunk_size=256, source=load_selected_source())
+        self.source_watcher = SourceWatcher()
         self.loudness = LoudnessMeter(self.audio.rate)
         self.level_l = ChannelLevel()
         self.level_r = ChannelLevel()
         self.last_time = glfw.get_time()
-
-        # Earlier revision added an easing step here (ChannelLevel-style
-        # ballistics on top of momentary_lufs) to smooth out per-chunk
-        # jitter. In practice that made the meter feel sluggish and
-        # unresponsive against fast music -- the 400ms momentary window
-        # inside LoudnessMeter itself already provides the intended
-        # BS.1770 smoothing, so a second easing layer on top was pure
-        # added lag with no real benefit. Reading momentary_lufs directly
-        # keeps the readout, bar fill, and M stat all reacting as fast as
-        # the underlying measurement actually changes.
 
         self.help_icon_cx = 0.965
         self.help_icon_cy = 0.87
@@ -598,6 +551,11 @@ class LoudnessWindow:
     # -----------------------------------------------------------------
 
     def _update_audio(self):
+        new_source = self.source_watcher.check()
+        if new_source is not None:
+            self.audio.reopen(new_source)
+            self.loudness = LoudnessMeter(self.audio.rate)
+
         now = glfw.get_time()
         dt = max(1e-4, now - self.last_time)
         self.last_time = now
@@ -606,7 +564,7 @@ class LoudnessWindow:
         if chunk is None:
             return
         left = chunk[:, 0]
-        right = chunk[:, 1]
+        right = chunk[:, 1] if chunk.shape[1] > 1 else chunk[:, 0]
 
         self.loudness.push(left, right, dt)
         self.level_l.update(left, dt)
@@ -617,15 +575,6 @@ class LoudnessWindow:
     # -----------------------------------------------------------------
 
     def _aspect_scale(self):
-        """
-        Because the window is aspect-locked (set_window_aspect_ratio),
-        width/height always maintain the base_width:base_height ratio
-        -- but the actual pixel size still changes as the user resizes.
-        Layout below is authored entirely in the *base* aspect's NDC
-        space; this uniform maps that space onto whatever the current
-        framebuffer's NDC actually is, which (since the ratio is locked)
-        reduces to a uniform scale, not a stretch -- so nothing skews.
-        """
         if self.width <= 0 or self.height <= 0:
             return 1.0, 1.0
         return 1.0, 1.0
@@ -650,10 +599,6 @@ class LoudnessWindow:
         glBindVertexArray(0)
 
     def _draw_gradient_bar(self, x0, y0, x1, y1, fill_x):
-        """Background track + gradient fill up to fill_x, colored by absolute
-        position on the DB_MIN..DB_MAX scale (not by fill fraction), so a
-        given dB value always renders the same color regardless of how
-        much of the bar is filled."""
         self._draw_solid_quad(x0, y0, x1, y1, (0.10, 0.10, 0.12))
         if fill_x > x0:
             glUseProgram(self.bar_program)
@@ -723,10 +668,6 @@ class LoudnessWindow:
         self._draw_solid_quad(-1.0, -1.0, 1.0, 1.0, (0.0, 0.0, 0.0), alpha=0.72)
         self._draw_solid_quad(-0.95, -0.85, 0.95, 0.85, (0.08, 0.08, 0.1), alpha=0.97)
 
-        # centered title across the full width, then two independent
-        # columns below it -- each column uses the panel's own left edge
-        # as its origin so the whole overlay width is put to use instead
-        # of collapsing into one narrow left-aligned block
         title_y = 0.72
         self._text(HELP_TITLE, 0.0, title_y, 1.6, (0.92, 0.92, 0.97), align="center", valign="top")
 
@@ -744,30 +685,16 @@ class LoudnessWindow:
     # -----------------------------------------------------------------
     # panels
     # -----------------------------------------------------------------
-    #
-    # Vertical layout below uses explicit cumulative offsets (each
-    # element's y computed from the previous one's y minus its own
-    # rendered height) instead of independent fixed deltas from y_top.
-    # The old version placed every line at y_top - <constant>, tuned by
-    # eye for one scale value each -- fine until the ~4.4x-scale LUFS
-    # readout's actual glyph height (which grows with pixel_scale) ran
-    # past where the bar was hardcoded to start. Chaining offsets means
-    # each block reserves space proportional to its own scale, so bumping
-    # any one scale can't make it collide with what's below it.
 
     def _draw_loudness_panel(self, x0, x1, y_top, y_bot):
         muted = (0.45, 0.45, 0.5)
         bright = (0.92, 0.92, 0.95)
 
-        # panel card background
         self._draw_solid_quad(x0, y_bot, x1, y_top, (0.055, 0.055, 0.065))
 
         header_y = y_top - 0.03
         self._text("LOUDNESS", x0 + 0.02, header_y, 1.9, muted, valign="top")
 
-        # big readout sits below the header with a fixed gap that scales
-        # with the header's own line height, then reserves its own
-        # (much taller, scale=4.4) line height before the bar starts
         big_val = f"{self.loudness.momentary_lufs:.1f} LUFS"
         big_y = header_y - 0.14
         self._text(big_val, (x0 + x1) / 2, big_y, 4.4, bright, align="center", valign="top")
@@ -778,7 +705,6 @@ class LoudnessWindow:
         fill_x = db_to_x(self.loudness.momentary_lufs, bar_x0, bar_x1)
         self._draw_gradient_bar(bar_x0, bar_y0, bar_x1, bar_y1, fill_x)
 
-        # short-term / integrated tick markers overlaid on the bar
         st_x = db_to_x(self.loudness.shortterm_lufs, bar_x0, bar_x1)
         int_x = db_to_x(self.loudness.integrated_lufs, bar_x0, bar_x1)
         tick_half = 0.0025
@@ -789,7 +715,6 @@ class LoudnessWindow:
         self._text("-60", bar_x0, scale_label_y, 1.4, muted, align="center", valign="top")
         self._text("0", bar_x1, scale_label_y, 1.4, muted, align="center", valign="top")
 
-        # stat row: M / S / INT / LRA / PK
         stats = [
             ("M", self.loudness.momentary_lufs, bright),
             ("S", self.loudness.shortterm_lufs, (0.45, 0.78, 0.95)),
@@ -821,7 +746,6 @@ class LoudnessWindow:
             ("R", self.level_r),
         ]
         row_top = header_y - 0.17
-        row_h = 0.30
         gap = 0.12
 
         for label, ch in rows:
@@ -839,7 +763,6 @@ class LoudnessWindow:
 
             row_top = bar_y0 - gap
 
-        # shared dB axis across the bottom
         axis_y = row_top - 0.02
         for db_val in (-60, -48, -36, -24, -12, 0):
             x = db_to_x(db_val, bar_x0, bar_x1)

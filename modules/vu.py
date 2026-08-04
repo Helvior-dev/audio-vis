@@ -25,9 +25,10 @@ import glfw
 import numpy as np
 from OpenGL.GL import *
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
+from audio_source_config import load_selected_source, SourceWatcher
 
 DB_MIN = -20.0
 DB_MAX = 3.0
@@ -242,7 +243,8 @@ class VUWindow:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        self.audio = AudioCapture(chunk_size=512)
+        self.audio = AudioCapture(chunk_size=512, source=load_selected_source())
+        self.source_watcher = SourceWatcher()
         self.current_db = DB_MIN       # raw measured level this frame
         self.displayed_db = DB_MIN     # eased value actually drawn
         self.peak_db = DB_MIN
@@ -253,6 +255,12 @@ class VUWindow:
         glViewport(0, 0, width, height)
 
     def _update_audio(self):
+        # cheap mtime check every frame; only re-reads/reopens when the
+        # launcher (or another window) actually changed the selection
+        new_source = self.source_watcher.check()
+        if new_source is not None:
+            self.audio.reopen(new_source)
+
         chunk = self.audio.read_chunk()
         if chunk is None:
             return

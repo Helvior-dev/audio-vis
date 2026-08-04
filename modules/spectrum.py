@@ -19,10 +19,11 @@ import glfw
 import numpy as np
 from OpenGL.GL import *
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 from audio_capture import AudioCapture
 from window_utils import apply_dark_titlebar
 from text_render import TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER, TextRenderer
+from audio_source_config import load_selected_source, SourceWatcher
 
 FFT_SIZE = 2048
 NUM_BARS = 64
@@ -152,7 +153,6 @@ class SpectrumWindow:
         self.program = link_program(VERTEX_SHADER, FRAGMENT_SHADER)
         self.color_loc = glGetUniformLocation(self.program, "color")
 
-        # one shared dynamic quad buffer, position rewritten per bar per frame
         self.vao = glGenVertexArrays(1)
         glBindVertexArray(self.vao)
         self.vbo = glGenBuffers(1)
@@ -163,8 +163,6 @@ class SpectrumWindow:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-        # solid-color program + VAO/VBO: shared by the help-icon circle
-        # outline and the overlay's background quads
         self.solid_program = link_program(SOLID_VERTEX_SHADER, SOLID_FRAGMENT_SHADER)
         self.solid_color_loc = glGetUniformLocation(self.solid_program, "color")
         self.solid_alpha_loc = glGetUniformLocation(self.solid_program, "alpha")
@@ -182,7 +180,8 @@ class SpectrumWindow:
         self.text = TextRenderer(self.text_program)
 
         self.read_chunk_size = 256
-        self.audio = AudioCapture(chunk_size=self.read_chunk_size)
+        self.audio = AudioCapture(chunk_size=self.read_chunk_size, source=load_selected_source())
+        self.source_watcher = SourceWatcher()
         self.rolling_buffer = np.zeros(FFT_SIZE, dtype=np.float32)
         self.window_fn = np.hanning(FFT_SIZE).astype(np.float32)
         self.bin_edges = make_log_bin_edges(NUM_BARS, FFT_SIZE)
@@ -222,49 +221,37 @@ class SpectrumWindow:
             self.help_open = True
 
     def _update_audio(self):
+        new_source = self.source_watcher.check()
+        if new_source is not None:
+            self.audio.reopen(new_source)
+            self.rolling_buffer[:] = 0.0
+
         chunk = self.audio.read_chunk()  # (read_chunk_size, channels)
         if chunk is None:
             return
         mono = chunk.mean(axis=1).astype(np.float32)
         n = len(mono)
 
-        # A window resize/drag stalls the render loop for a bit (GLFW
-        # blocks pumping frames during the native resize drag on
-        # Windows), so several audio callbacks' worth of chunks pile up
-        # in AudioCapture's queue. The next read_chunk() call then
-        # returns all of them concatenated -- n can come back larger
-        # than FFT_SIZE (rolling_buffer's fixed size). Only the most
-        # recent FFT_SIZE samples are relevant to the rolling window
-        # anyway, so trim before the roll/assign -- same fix as
-        # spectrum_analyzer.py's _update_audio.
         if n > FFT_SIZE:
             mono = mono[-FFT_SIZE:]
             n = FFT_SIZE
 
-        # slide the rolling buffer and append the new samples at the end
         self.rolling_buffer = np.roll(self.rolling_buffer, -n)
         self.rolling_buffer[-n:] = mono
 
         windowed = self.rolling_buffer * self.window_fn
         spectrum = np.fft.rfft(windowed)
-        # normalize by the window's coherent gain (sum/2) -- raw FFT
-        # magnitude scales with FFT_SIZE and the Hann window's energy
-        # loss, so without this a -12dBFS signal reads as +41dB and
-        # every bar clips to the ceiling regardless of actual volume
         magnitude = np.abs(spectrum) / (self.window_fn.sum() / 2)
 
-        # group FFT bins into log-spaced bars by averaging magnitude within each range
         bar_magnitudes = np.zeros(self.actual_num_bars, dtype=np.float32)
         for i in range(self.actual_num_bars):
             lo, hi = self.bin_edges[i], self.bin_edges[i + 1]
-            hi = max(hi, lo + 1)  # ensure at least one bin per bar
+            hi = max(hi, lo + 1)
             bar_magnitudes[i] = magnitude[lo:hi].mean()
 
-        # convert to dB, avoiding log(0)
         db = 20.0 * np.log10(np.maximum(bar_magnitudes, 1e-10))
         db = np.clip(db, DB_FLOOR, DB_CEIL)
 
-        # exponential smoothing toward the new value so bars don't jitter frame-to-frame
         self.smoothed_db = SMOOTHING * self.smoothed_db + (1.0 - SMOOTHING) * db
 
     def _quad_verts(self, x0: float, x1: float, y0: float, y1: float) -> np.ndarray:
@@ -275,10 +262,6 @@ class SpectrumWindow:
             ],
             dtype=np.float32,
         )
-
-    # -----------------------------------------------------------------
-    # help icon / overlay
-    # -----------------------------------------------------------------
 
     def _draw_quad_window(self, x0, y0, x1, y1, color, alpha=1.0):
         glUniform3f(self.solid_color_loc, *color)
@@ -355,13 +338,12 @@ class SpectrumWindow:
 
         n = self.actual_num_bars
         bar_width = 2.0 / n
-        gap = bar_width * 0.15  # small gap between bars
+        gap = bar_width * 0.15
 
         for i in range(n):
             x0 = -1.0 + i * bar_width + gap * 0.5
             x1 = -1.0 + (i + 1) * bar_width - gap * 0.5
 
-            # normalize dB to [0, 1] then to y-range [-1, 1]
             level = (self.smoothed_db[i] - DB_FLOOR) / (DB_CEIL - DB_FLOOR)
             level = max(0.0, min(1.0, level))
             y0 = -1.0
@@ -370,9 +352,6 @@ class SpectrumWindow:
             verts = self._quad_verts(x0, x1, y0, y1)
             glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
 
-            # color gradient: blue-ish for normal levels, red only near the
-            # top of the range (close to 0dB / clipping), matching how the
-            # VU meter reserves red for actual overload rather than "loud".
             if level < 0.93:
                 glUniform3f(self.color_loc, 0.55, 0.68, 0.85)
             else:
