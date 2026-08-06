@@ -1,228 +1,82 @@
-# Audio Visualizer
+# Audio Visualizer (MiniMeters-inspired Fan Project)
 
-A real-time audio visualization application for Windows written in Python.
+A real-time, GPU-accelerated audio visualization suite for Windows written in Python. Inspired by modern audio meters like MiniMeters, this project provides a set of modular visualizers for monitoring audio playback directly from system output (WASAPI Loopback).
 
-The project captures system audio using Windows WASAPI Loopback and renders multiple GPU-accelerated visualizations with OpenGL. Every visualizer runs as an independent process, allowing modules to be launched, restarted, or closed without affecting the rest of the application.
-
-> **AI-assisted project**
->
-> This project is developed using modern AI coding assistants.
->
-> AI is used as a development tool for implementation, explanations, and rapid prototyping. All features, architecture, debugging, testing, profiling, and iterative improvements are directed by the project author. Every generated change is reviewed, tested, and refined before becoming part of the project.
+> **Disclaimer & Project Purpose**
+> This is a non-commercial, fan-made project created for educational purposes and personal audio monitoring. 
+> It was built with the assistance of AI coding tools to experiment with Python DSP (Digital Signal Processing), PyOpenGL, and real-time audio capture.
 
 ---
 
-# Features
+## Features
 
-* Real-time system audio capture (Windows WASAPI Loopback)
-* Hardware-accelerated rendering using OpenGL
-* Multiple independent visualization modules
-* Separate process for every visualization window
-* Native dark Windows title bars
-* Resizable windows
-* VSync rendering
-* Low CPU usage
-* Modular architecture
+- **System Audio Capture:** Captures native Windows audio using WASAPI Loopback (no virtual cables required).
+- **Multi-Process Architecture:** Every visualizer window runs in its own independent process. If one window is resized, restarted, or closed, the rest keep running without latency drops.
+- **GPU-Accelerated Rendering:** Smooth, high-FPS visuals built on PyOpenGL and GLFW.
+- **Dark Windows Integration:** Custom dark title bars matching the UI design.
+- **Modular Control Launcher:** A lightweight launcher GUI to toggle individual meters on and off.
 
 ---
 
-# Available Visualizers
+## Modules Included
 
-## Loudness
-
-Professional loudness and peak metering.
-
-Features:
-
-* Momentary (M)
-* Short-Term (S)
-* Integrated (INT)
-* Loudness Range (LRA)
-* Peak Level
-* Stereo L/R level meters
-* Smooth attack/release animation
-* Peak hold indicators
-* GPU-rendered gradients
+| Module | Description |
+| :--- | :--- |
+| **Loudness Meter** | Momentary (M), Short-Term (S), Integrated (INT), LRA, Peak levels, and stereo L/R meters adhering to EBU R128 / ITU-R BS.1770 concepts. |
+| **Oscilloscope** | Real-time waveform display featuring correlation-based triggering for a stable trace even with complex musical content. |
+| **Spectrum** | Fast Fourier Transform (FFT) spectrum analyzer with logarithmic frequency scaling and temporal smoothing. |
+| **Spectrum Analyzer** | Detailed spectrum view with frequency markers, musical note detection, and interactive hover inspection. |
+| **Vectorscope / Stereometer** | Mid/Side phase display, Lissajous stereo field visualizer, and correlation meters. |
 
 ---
 
-## Oscilloscope
+## Requirements & Tech Stack
 
-Real-time waveform display with correlation-based triggering.
-
-Unlike a traditional zero-crossing oscilloscope, this implementation searches for the trigger position that best matches the previous frame, producing a much more stable display for complex music.
-
-Features:
-
-* Stable triggering
-* Smooth rendering
-* GPU acceleration
-* VSync rendering
+- **OS:** Windows 10 / 11 (WASAPI Loopback requirement)
+- **Language:** Python 3.10+ (Tested up to Python 3.14)
+- **Dependencies:**
+  - `PyOpenGL` & `PyOpenGL_accelerate`
+  - `glfw`
+  - `numpy`
+  - `pyaudiowpatch`
+  - `tkinter` (Standard Python library)
 
 ---
 
-## Spectrum
+## Quick Start
 
-FFT spectrum analyzer.
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/Helvior-dev/audio-vis.git
+   cd audio-vis
+   ```
 
-Features:
+2. **Install dependencies:**
+   ```bash
+   pip install PyOpenGL PyOpenGL_accelerate glfw numpy pyaudiowpatch
+   ```
 
-* Real-time FFT
-* Logarithmic frequency bins
-* dB scale
-* Temporal smoothing
-* GPU-rendered bars
-
----
-
-## Spectrum Analyzer
-
-Advanced spectrum visualization.
-
-Features:
-
-* Dense logarithmic FFT display
-* Envelope tracking
-* Frequency labels
-* Musical note detection
-* Hover inspection
-* GPU-accelerated rendering
+3. **Launch the app:**
+   ```bash
+   python main.py
+   ```
 
 ---
 
-## Vectorscope
+## How It Works
 
-Stereo image visualization using a Lissajous display.
-
-Features:
-
-* Mid/Side visualization
-* Stereo correlation meter
-* Phase monitoring
-* Stereo field analysis
+- **Audio Pipeline:** `pyaudiowpatch` captures system output via WASAPI Loopback and broadcasts raw audio buffers to active modules.
+- **Isolation:** Launcher spawns each visualizer module via `subprocess`.
+- **Text & UI Rendering:** Custom bitmap text rendering pipeline optimized for raw OpenGL calls without heavy external GUI framework overhead.
 
 ---
 
-# Technologies
+## AI & Development Note
 
-* Python 3.14
-* PyOpenGL
-* GLFW
-* NumPy
-* PyAudioWPatch
-* Tkinter
+This repository was created using an iterative AI-assisted workflow. Coding assistants were used to prototype DSP algorithms, generate initial OpenGL shaders, and handle boilerplate code, while debugging, architecture design, profiling, and final refinements were done manually.
 
 ---
 
-# Installation
+## License
 
-```bash
-git clone https://github.com/yourusername/audio-visualizer.git
-
-cd audio-visualizer
-
-pip install PyOpenGL PyOpenGL_accelerate glfw numpy pyaudiowpatch
-```
-
----
-
-# Running
-
-```bash
-python main.py
-```
-
-The launcher allows every visualization module to be started independently.
-
-Each visualizer runs in its own process, so a crash or restart of one module does not affect the launcher or the remaining windows. This architecture also allows modules to be profiled and developed independently.
-
----
-
-# Project Structure
-
-```text
-.
-├── README.md
-├── main.py
-├── modules/
-│   ├── audio_capture.py
-│   ├── loudness.py
-│   ├── oscilloscope.py
-│   ├── spectrum.py
-│   ├── spectrum_analyzer.py
-│   ├── stereometer.py
-│   ├── text_render.py
-│   └── window_utils.py
-```
-
----
-
-# Development
-
-This project follows an iterative AI-assisted development workflow.
-
-Typical development cycle:
-
-1. Design the feature.
-2. Research the underlying DSP or rendering technique.
-3. Generate an initial implementation using AI.
-4. Review the generated code.
-5. Debug and profile performance.
-6. Improve architecture and rendering quality.
-7. Repeat until the desired result is achieved.
-
-The objective is not simply generating code, but understanding, validating, and refining every implementation.
-
----
-
-# Technical Highlights
-
-Current implementation includes:
-
-* Windows WASAPI Loopback audio capture.
-* Independent visualization processes.
-* GPU rendering through raw OpenGL.
-* Logarithmic FFT analysis.
-* Correlation-based oscilloscope triggering.
-* Loudness measurements inspired by ITU-R BS.1770 / EBU R128 concepts.
-* Shared bitmap text rendering pipeline for OpenGL modules.
-* Native Windows dark title bars for all windows.
-
----
-
-# Platform
-
-Supported operating systems:
-
-* Windows 10
-* Windows 11
-
-System audio capture relies on Windows WASAPI Loopback and is therefore currently Windows-only.
-
----
-
-# Future Plans
-
-Potential future additions include:
-
-* Recording support
-* Frame export
-* Theme customization
-* Additional visualization modules
-* Configuration system
-* Performance overlay
-* Cross-platform support where technically possible
-
----
-
-# Acknowledgements
-
-This project is developed with the assistance of modern AI coding tools.
-
-Rather than replacing the development process, AI is used to accelerate implementation and experimentation while all architectural decisions, validation, debugging, testing, and iterative refinement remain under the author's control.
-
----
-
-# License
-
-Released under the MIT License.
+MIT License. Feel free to fork, modify, and experiment!
